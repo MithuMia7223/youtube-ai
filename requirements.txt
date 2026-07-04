@@ -1,0 +1,29 @@
+# Telegram Bot
+pyTelegramBotAPI
+
+# Google AI & YouTube APIs
+google-genai
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+
+# YouTube Utilities
+youtube-transcript-api
+yt-dlp
+
+# Environment & Config
+python-dotenv
+
+# ── NEW: AI Faceless Video System ─────────────────────────
+# TTS - Microsoft Edge Neural Voices (free, high quality)
+edge-tts
+
+# Video Editing
+moviepy
+imageio[ffmpeg]
+
+# Image Processing (Thumbnails)
+Pillow
+
+# HTTP Requests (Pexels stock footage)
+requests
