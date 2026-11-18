@@ -25,5 +25,9 @@ imageio[ffmpeg]
 # Image Processing (Thumbnails)
 Pillow
 
+# Face Tracking (crop window follows the face)
+# 4.x kept for bundled Haar cascades (removed in OpenCV 5.x)
+opencv-python-headless>=4.10,<5
+
 # HTTP Requests (Pexels stock footage)
 requests

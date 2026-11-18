@@ -1,0 +1,1721 @@
+import os
+import subprocess
+import tempfile
+import random
+import re
+import imageio_ffmpeg
+import numpy as np
+from moviepy import VideoFileClip, AudioFileClip, CompositeAudioClip, concatenate_audioclips
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def set_ffmpeg_path():
+    """Dynamically add imageio_ffmpeg's precompiled ffmpeg binary folder and virtualenv bin to PATH."""
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+        
+        # Ensure a file/symlink literally named "ffmpeg" exists in the binaries folder
+        # (yt-dlp looks specifically for "ffmpeg" in PATH, not "ffmpeg-macos-aarch64-v7.1")
+        target_name = "ffmpeg"
+        if os.name == "nt":
+            target_name = "ffmpeg.exe"
+            
+        bin_ffmpeg = os.path.join(ffmpeg_dir, target_name)
+        if not os.path.exists(bin_ffmpeg):
+            try:
+                os.symlink(os.path.basename(ffmpeg_exe), bin_ffmpeg)
+            except Exception:
+                try:
+                    import shutil
+                    shutil.copy2(ffmpeg_exe, bin_ffmpeg)
+                except Exception as sym_err:
+                    print(f"[Warning] Failed to link/copy ffmpeg: {sym_err}")
+
+        if ffmpeg_dir not in os.environ["PATH"]:
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ["PATH"]
+        
+        # Add actual project venv bin directory to PATH explicitly
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        venv_bin = os.path.join(project_dir, ".venv", "bin")
+        if os.path.isdir(venv_bin) and venv_bin not in os.environ["PATH"]:
+            os.environ["PATH"] = venv_bin + os.pathsep + os.environ["PATH"]
+            
+        import sys
+        sys_venv_bin = os.path.dirname(sys.executable)
+        if sys_venv_bin not in os.environ["PATH"]:
+            os.environ["PATH"] = sys_venv_bin + os.pathsep + os.environ["PATH"]
+    except Exception as e:
+        print(f"[Warning] Failed to set imageio ffmpeg path: {e}")
+
+_encoder_cache = None
+
+def get_best_encoder():
+    """Determine the best available video encoder (hardware accelerated if possible)."""
+    global _encoder_cache
+    if _encoder_cache is not None:
+        return _encoder_cache
+        
+    set_ffmpeg_path()
+    try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        res = subprocess.run([ffmpeg_exe, "-encoders"], capture_output=True, text=True, check=True)
+        if "h264_videotoolbox" in res.stdout:
+            _encoder_cache = ("h264_videotoolbox", ["-q:v", "65", "-realtime", "1", "-allow_sw", "1"])
+            print("[INFO] Hardware acceleration enabled: Using h264_videotoolbox")
+        else:
+            _encoder_cache = ("libx264", ["-preset", "superfast"])
+            print("[INFO] Hardware acceleration not found: Using libx264")
+    except Exception as e:
+        print(f"[Warning] Failed to check encoders: {e}. Defaulting to libx264.")
+        _encoder_cache = ("libx264", ["-preset", "superfast"])
+        
+    return _encoder_cache
+
+def get_ytdlp_path():
+    """Get the path to yt-dlp, looking in the venv first, then PATH."""
+    import sys
+    import shutil
+    # Add deno to PATH if available (yt-dlp uses it as JS runtime for YouTube)
+    deno_path = os.path.expanduser("~/.deno/bin")
+    if os.path.isdir(deno_path) and deno_path not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = deno_path + os.pathsep + os.environ.get("PATH", "")
+    # Check if yt-dlp exists in the virtualenv bin directory
+    venv_bin_dir = os.path.dirname(sys.executable)
+    venv_ytdlp = os.path.join(venv_bin_dir, "yt-dlp")
+    if os.path.exists(venv_ytdlp):
+        return venv_ytdlp
+    # Check PATH
+    path_ytdlp = shutil.which("yt-dlp")
+    if path_ytdlp:
+        return path_ytdlp
+    return "yt-dlp"
+
+def get_ytdlp_js_args():
+    deno_exe = os.path.expanduser("~/.deno/bin/deno")
+    if os.path.exists(deno_exe):
+        return ["--js-runtimes", f"deno:{deno_exe}"]
+    return ["--js-runtimes", "deno"]
+
+def shape_bengali(text: str) -> str:
+    """
+    Decompose combined Bengali vowels (ো, ৌ) and reorder pre-vowels (ি, ে, ৈ)
+    to the left of their consonant/conjunct clusters for standard FreeType rendering.
+    """
+    text = text.replace("\u09CB", "\u09C7\u09BE")  # ো -> ে + া
+    text = text.replace("\u09CC", "\u09C7\u09D7")  # ৌ -> ে + ৗ
+    
+    chars = list(text)
+    pre_vowels = {"\u09BF", "\u09C7", "\u09C8"} # ি, ে, ৈ
+    
+    i = 0
+    while i < len(chars):
+        if chars[i] in pre_vowels:
+            val = chars.pop(i)
+            j = i - 1
+            while j > 0:
+                if chars[j - 1] == "\u09CD":
+                    j -= 2
+                else:
+                    break
+            chars.insert(max(0, j), val)
+        else:
+            i += 1
+    return "".join(chars)
+
+
+def get_best_font_path(font_type="bangla"):
+    """
+    Find a valid font file path dynamically based on OS to prevent FFmpeg crashes.
+    """
+    import os
+    if font_type == "bangla":
+        candidates = [
+            # macOS paths
+            "/System/Library/Fonts/Supplemental/Bangla Sangam MN.ttc",
+            "/System/Library/Fonts/Supplemental/Bangla MN.ttc",
+            "/System/Library/Fonts/KohinoorBangla.ttc",
+            # Linux paths
+            "/usr/share/fonts/truetype/lohit-bengali/Lohit-Bengali.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            "/usr/share/fonts/opentype/malayalam/SolaimanLipi.ttf",
+            "/usr/share/fonts/SolaimanLipi.ttf",
+            # Windows paths
+            "C:\\Windows\\Fonts\\vrinda.ttf",
+            "C:\\Windows\\Fonts\\shonar.ttf"
+        ]
+    else: # english / default / helvetica
+        candidates = [
+            # macOS paths
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Verdana.ttf",
+            # Linux paths
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            # Windows paths
+            "C:\\Windows\\Fonts\\arial.ttf"
+        ]
+        
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+            
+    # Absolute fallbacks (if nothing found, hope FFmpeg can resolve by name or just return the first Mac path)
+    return candidates[0]
+
+def parse_time(time_str):
+    """Parse time string formats (HH:MM:SS, MM:SS, or seconds) into float seconds."""
+    time_str = str(time_str).strip()
+    if not time_str:
+        return 0
+    try:
+        if ":" in time_str:
+            parts = list(map(float, time_str.split(":")))
+            if len(parts) == 1:
+                return parts[0]
+            elif len(parts) == 2:
+                # MM:SS
+                return parts[0] * 60 + parts[1]
+            elif len(parts) == 3:
+                # HH:MM:SS
+                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        return float(time_str)
+    except Exception:
+        return 0
+
+def format_seconds(seconds):
+    """Format seconds into HH:MM:SS string."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def extract_video_id(url):
+    """Extract standard 11-character YouTube video ID from a URL."""
+    pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
+    match = re.search(pattern, url)
+    if match:
+        return match.group(1)
+    if "v=" in url:
+        return url.split("v=")[1].split("&")[0]
+    if "youtu.be/" in url:
+        return url.split("youtu.be/")[1].split("?")[0]
+    return None
+
+def get_video_transcript(video_id):
+    """Fetch video transcript from YouTube in Bengali or English."""
+    from youtube_transcript_api import YouTubeTranscriptApi
+    try:
+        api = YouTubeTranscriptApi()
+        transcript_list = api.fetch(video_id, languages=['bn', 'en'])
+        transcript_text = ""
+        for item in transcript_list:
+            start = item.start
+            text = item.text
+            m, s = divmod(int(start), 60)
+            h, m = divmod(m, 60)
+            time_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+            transcript_text += f"[{time_str}] {text}\n"
+        return transcript_text
+    except Exception as e:
+        print(f"Standard transcript API failed: {e}. Trying yt-dlp subtitle download...")
+        try:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            import tempfile
+            import subprocess
+            import re
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                vtt_base = os.path.join(temp_dir, f"sub_{video_id}")
+                langs = ["bn", "en"]
+                vtt_path = None
+                
+                for lang in langs:
+                    cookie_opts = [["--cookies", "cookies.txt"]] if os.path.exists("cookies.txt") else []
+                    cookie_opts.append([])
+                    
+                    found_lang = False
+                    for opt in cookie_opts:
+                        cmd = [
+                            get_ytdlp_path(),
+                        ] + get_ytdlp_js_args() + [
+                            "--write-subs",
+                            "--write-auto-subs",
+                            "--sub-lang", lang,
+                            "--skip-download",
+                            "-o", vtt_base,
+                        ]
+                        cmd.extend(opt)
+                        cmd.append(url)
+                        
+                        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        
+                        expected_path = f"{vtt_base}.{lang}.vtt"
+                        if os.path.exists(expected_path):
+                            vtt_path = expected_path
+                            found_lang = True
+                            break
+                    if found_lang:
+                        break
+                
+                if vtt_path and os.path.exists(vtt_path):
+                    with open(vtt_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    
+                    lines = content.split("\n")
+                    transcript_text = ""
+                    seen_texts = set()
+                    time_pattern = re.compile(r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s+-->")
+                    current_time_str = ""
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        match = time_pattern.match(line)
+                        if match:
+                            h, m, s, _ = match.groups()
+                            current_time_str = f"{h}:{m}:{s}" if int(h) > 0 else f"{m}:{s}"
+                            continue
+                        if line == "WEBVTT" or line.startswith("Kind:") or line.startswith("Language:"):
+                            continue
+                        cleaned = re.sub(r"<[^>]+>", "", line)
+                        cleaned = cleaned.replace("&gt;&gt;", "").replace("&lt;", "<").replace("&gt;", ">").strip()
+                        if not cleaned:
+                            continue
+                        normalized = re.sub(r"\s+", "", cleaned)
+                        if normalized in seen_texts:
+                            continue
+                        seen_texts.add(normalized)
+                        if current_time_str:
+                            transcript_text += f"[{current_time_str}] {cleaned}\n"
+                    
+                    if transcript_text:
+                        print(f"Successfully retrieved transcript using yt-dlp fallback for {video_id}!")
+                        return transcript_text
+        except Exception as fallback_err:
+            print(f"yt-dlp transcript fallback failed: {fallback_err}")
+        return ""
+
+def clean_overlapping_segments(segments):
+    """Sort and adjust segments to ensure there are no overlapping timeframes."""
+    parsed_segs = []
+    for seg in segments:
+        start_str = seg.get("start_time", "0")
+        dur = int(seg.get("duration", 0))
+        try:
+            start_sec = parse_time(start_str)
+        except Exception:
+            start_sec = 0
+        parsed_segs.append({
+            "start_sec": start_sec,
+            "duration": dur,
+            "original": seg
+        })
+    
+    # Sort by starting seconds
+    parsed_segs.sort(key=lambda x: x["start_sec"])
+    
+    unique_segs = []
+    for ps in parsed_segs:
+        if not unique_segs:
+            unique_segs.append(ps)
+            continue
+        
+        last = unique_segs[-1]
+        last_end = last["start_sec"] + last["duration"]
+        
+        # If this segment starts before the last segment ends, they overlap!
+        if ps["start_sec"] < last_end:
+            overlap = last_end - ps["start_sec"]
+            if overlap >= ps["duration"]:
+                # Completely covered by the previous segment, skip this one
+                continue
+            else:
+                # Adjust start time and reduce duration to remove the overlap
+                new_start = last_end
+                new_dur = ps["duration"] - overlap
+                ps["start_sec"] = new_start
+                ps["duration"] = new_dur
+                
+                # Format back to MM:SS or HH:MM:SS
+                m, s = divmod(new_start, 60)
+                h, m = divmod(m, 60)
+                time_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+                ps["original"]["start_time"] = time_str
+                ps["original"]["duration"] = new_dur
+                unique_segs.append(ps)
+        else:
+            unique_segs.append(ps)
+            
+    return [x["original"] for x in unique_segs]
+
+def find_best_segments_with_gemini(transcript_text, video_duration, is_short):
+    """
+    Analyze the transcript with Google Gemini to find a list of the most engaging highlight segments
+    and a specific 20-30s teaser hook.
+    For Shorts: returns exactly 1 segment of 30-60 seconds, teaser is ignored.
+    For Long: returns a list of 5 to 7 separate high-engagement segments, and a 20-30s teaser hook.
+    The total duration of the segments is dynamically chosen between 12 and 14 minutes.
+    """
+    from gemini_helper import client, DEFAULT_MODEL
+    from google.genai import types
+    import json
+    
+    if not client or not transcript_text:
+        return None
+        
+    if is_short:
+        prompt = f"""
+        You are a professional YouTube growth hacker and video editor specializing in viral Bangla Natok (drama) Shorts, TikToks, and Reels.
+        Below is the transcript of a drama video (with timestamps).
+        
+        Your goal is to identify a single highly viral, intense, EMOTIONAL highlight scene (sad, crying, tragic, or heart-touching moment) that tells a mini-story or has a massive emotional payoff.
+        
+        Requirements:
+        1. Find a segment of 30 to 58 seconds.
+        2. The start of the segment MUST be a strong "hook" (an emotional crying moment, a sad realization, a dramatic confession, or an intense heartbreak) that immediately grabs attention within the first 2 seconds.
+        3. The segment should end on a dramatic emotional cliffhanger or a satisfying emotional resolution.
+        4. Do not include silent intros, comedy, or slow setups.
+        
+        Transcript:
+        {transcript_text}
+        """
+    else:
+        prompt = f"""
+        You are an expert YouTube drama compilation editor. Your task is to create a 12 to 15 minute highlight compilation from the drama transcript below.
+        
+        CRITICAL RULES:
+        - All segments MUST be intense, emotional, sad, tragic, or crying scenes (high-emotion drama moments).
+        - Avoid comedy, funny encounters, or generic talking scenes. Focus strictly on the emotional peak highlights of the drama.
+
+        STRICT REQUIREMENTS — You MUST follow all of these:
+        1. YOU MUST SELECT A MINIMUM OF 8 segments and a MAXIMUM OF 12 segments. Do NOT return fewer than 8 segments under any circumstances.
+        2. Each segment duration MUST be between 60 and 120 seconds (1 to 2 minutes each). Do NOT pick segments shorter than 60 seconds.
+        3. The TOTAL combined duration of ALL segments MUST be between 720 and 900 seconds (12 to 15 minutes). Count the seconds carefully.
+        4. Spread the segments evenly: pick emotional scenes from the beginning (first 25%), middle (25%-75%), and end (last 25%) of the drama. Do NOT cluster all segments in one area.
+        5. CRITICAL: No two segments may overlap in time. Each scene must have a completely different start time.
+        6. The VERY LAST segment in your list MUST be the final resolution or emotional ending scene of the drama so the compilation has a clear ending.
+        7. For the teaser hook: pick the single most explosive, heart-wrenching, or crying 20-30 second moment from ANY part of the video. The teaser MUST have a different start_time from all main segments.
+        8. If the source video is shorter than 15 minutes, still pick 8 segments by reducing each segment duration proportionally, but never below 40 seconds each.
+
+        REMINDER: Return EXACTLY 8 to 12 segments. Each segment between 60-120 seconds. Total = 12-15 minutes.
+
+        Transcript:
+        {transcript_text}
+        """
+        
+    import time
+    for attempt in range(3):
+        try:
+            from pydantic import BaseModel
+            class Segment(BaseModel):
+                start_time: str
+                duration: int
+                narration: str
+                
+            class SegmentList(BaseModel):
+                segments: list[Segment]
+                teaser_start_time: str
+                teaser_duration: int
+                
+            response = client.models.generate_content(
+                model=DEFAULT_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=SegmentList,
+                )
+            )
+            res_dict = json.loads(response.text)
+            print(f"Gemini suggested segments: {res_dict}")
+            raw_segs = res_dict.get("segments", [])
+            cleaned_segs = clean_overlapping_segments(raw_segs)
+            
+            # Validate: long video must have at least 5 segments totaling enough duration
+            if not is_short:
+                total_dur = sum(int(s.get("duration", 0)) for s in cleaned_segs)
+                print(f"[Gemini] Long video: {len(cleaned_segs)} segments, total={total_dur}s ({total_dur//60}m {total_dur%60}s)")
+                if len(cleaned_segs) < 5 or total_dur < 600:  # less than 5 segments or < 10 min
+                    print(f"[Gemini] WARNING: Not enough segments ({len(cleaned_segs)}) or duration ({total_dur}s). Will use fallback distribution.")
+                    return None  # Trigger fallback in bot.py
+            
+            return {
+                "segments": cleaned_segs,
+                "teaser_start_time": res_dict.get("teaser_start_time", "").strip(),
+                "teaser_duration": int(res_dict.get("teaser_duration", 0))
+            }
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed to find segments with Gemini: {e}")
+            if attempt == 2:
+                return None
+            time.sleep(2)
+
+def get_video_duration(url):
+    """Get the video title and duration in seconds using yt-dlp."""
+    set_ffmpeg_path()
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    # Try multiple client strategies to bypass 403
+    client_strategies = ["android", "ios", "tv_embedded", "mweb", None]
+    cookie_prefix = ["--cookies", "cookies.txt"] if os.path.exists("cookies.txt") else []
+
+    for client in client_strategies:
+        cmd = [get_ytdlp_path()] + get_ytdlp_js_args() + [
+               "--dump-json", "--no-playlist",
+               "--user-agent", user_agent,
+               "--no-check-certificates", "--force-ipv4"]
+        if cookie_prefix:
+            cmd += cookie_prefix
+        if client:
+            cmd += ["--extractor-args", f"youtube:player_client={client}"]
+        cmd.append(url)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+            import json
+            data = json.loads(res.stdout)
+            return int(data.get("duration", 0)), data.get("title", "YouTube Clip")
+        except Exception as e:
+            print(f"[get_video_duration] client={client} failed: {e}")
+
+    return 0, "YouTube Clip"
+
+def download_youtube_clip(url, start_time_str, duration, output_path):
+    """Download the full video and clip a single range locally to bypass YouTube's ffmpeg block."""
+    set_ffmpeg_path()
+    download_multiple_youtube_clips(url, [(start_time_str, duration)], output_path)
+    return output_path
+
+def download_multiple_youtube_clips(url, clip_ranges, output_path):
+    """Download specific ranges directly from YouTube using --download-sections, with full fallback."""
+    set_ffmpeg_path()
+
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    
+    # Base strategies for client options (order of preference: default/web client first for 1080p, then fallbacks)
+    base_strategies = []
+    if os.path.exists("cookies.txt"):
+        base_strategies.extend([
+            ["--cookies", "cookies.txt"],
+            ["--cookies", "cookies.txt", "--extractor-args", "youtube:player_client=ios"],
+            ["--cookies", "cookies.txt", "--extractor-args", "youtube:player_client=android"]
+        ])
+    base_strategies.extend([
+        [],
+        ["--extractor-args", "youtube:player_client=ios"],
+        ["--extractor-args", "youtube:player_client=android"],
+        ["--extractor-args", "youtube:player_client=tv_embedded"],
+        ["--extractor-args", "youtube:player_client=mweb"]
+    ])
+
+    segment_paths = []
+    try:
+        print("[yt-dlp] Attempting fast download-sections strategy...")
+        for idx, (start_time_str, duration_val) in enumerate(clip_ranges):
+            segment_path = output_path.replace(".mp4", f"_seg_{idx}.mp4")
+            start_sec = parse_time(start_time_str)
+            end_sec = start_sec + duration_val
+            
+            success = False
+            for s_idx, extra in enumerate(base_strategies):
+                cmd = [
+                    get_ytdlp_path(),
+                ] + get_ytdlp_js_args() + [
+                    "-f", "bestvideo[height<=1080][vcodec*=avc]+bestaudio[ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/bestvideo+bestaudio/best",
+                    "--merge-output-format", "mp4",
+                    "--user-agent", user_agent,
+                    "--socket-timeout", "30",
+                    "--concurrent-fragments", "4",
+                    "--retries", "5",
+                    "--download-sections", f"*{start_sec}-{end_sec}",
+                    "-o", segment_path,
+                ] + extra + [url]
+                
+                try:
+                    subprocess.run(cmd, check=True)
+                    if os.path.exists(segment_path) and os.path.getsize(segment_path) > 100000:
+                        success = True
+                        break
+                except Exception:
+                    if os.path.exists(segment_path):
+                        try:
+                            os.remove(segment_path)
+                        except:
+                            pass
+            if success:
+                segment_paths.append(segment_path)
+            else:
+                raise RuntimeError("Failed to download section.")
+                
+        # If all sections succeeded, concatenate them
+        concat_txt_path = output_path.replace(".mp4", "_concat_list.txt")
+        with open(concat_txt_path, "w") as f:
+            for seg in segment_paths:
+                f.write(f"file '{os.path.abspath(seg)}'\n")
+                
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_txt_path,
+            "-c", "copy",
+            output_path
+        ]
+        subprocess.run(concat_cmd, check=True)
+        
+        # Cleanup
+        for seg in segment_paths:
+            if os.path.exists(seg):
+                try:
+                    os.remove(seg)
+                except:
+                    pass
+        if os.path.exists(concat_txt_path):
+            try:
+                os.remove(concat_txt_path)
+            except:
+                pass
+        print("[yt-dlp] Fast download-sections strategy succeeded!")
+        return
+        
+    except Exception as fast_err:
+        print(f"[yt-dlp] Fast strategy failed: {fast_err}. Falling back to full video download...")
+        # Cleanup any partially downloaded segments
+        for seg in segment_paths:
+            if os.path.exists(seg):
+                try:
+                    os.remove(seg)
+                except:
+                    pass
+
+    # FALLBACK: Download full video and slice locally (the original slower method)
+    temp_full = output_path.replace(".mp4", "_temp_full.mp4")
+    success = False
+    for strategy in base_strategies:
+        cmd = [
+            get_ytdlp_path(),
+        ] + get_ytdlp_js_args() + [
+            "-f", "bestvideo[height<=1080][vcodec*=avc]+bestaudio[ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/bestvideo+bestaudio/best",
+            "--merge-output-format", "mp4",
+            "--user-agent", user_agent,
+            "--socket-timeout", "30",
+            "--concurrent-fragments", "4",
+            "--retries", "5",
+            "-o", temp_full,
+        ] + strategy + [url]
+        
+        try:
+            subprocess.run(cmd, check=True)
+            if os.path.exists(temp_full) and os.path.getsize(temp_full) > 100000:
+                success = True
+                break
+        except Exception:
+            if os.path.exists(temp_full):
+                try:
+                    os.remove(temp_full)
+                except:
+                    pass
+                    
+    if not success or not os.path.exists(temp_full):
+        raise RuntimeError("Failed to download YouTube video using native yt-dlp.")
+        
+    # Cut the segments locally using ffmpeg and merge them
+    segment_paths = []
+    concat_txt_path = output_path.replace(".mp4", "_concat_list.txt")
+    try:
+        for idx, (start_time_str, duration_val) in enumerate(clip_ranges):
+            segment_path = output_path.replace(".mp4", f"_seg_{idx}.mp4")
+            crop_cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start_time_str),
+                "-t", str(duration_val),
+                "-i", temp_full,
+                "-c", "copy",
+                "-avoid_negative_ts", "make_non_negative",
+                segment_path
+            ]
+            subprocess.run(crop_cmd, check=True)
+            if os.path.exists(segment_path):
+                segment_paths.append(segment_path)
+                
+        with open(concat_txt_path, "w") as f:
+            for seg in segment_paths:
+                f.write(f"file '{os.path.abspath(seg)}'\n")
+                
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_txt_path,
+            "-c", "copy",
+            output_path
+        ]
+        subprocess.run(concat_cmd, check=True)
+        
+    finally:
+        for seg in segment_paths:
+            if os.path.exists(seg):
+                try:
+                    os.remove(seg)
+                except:
+                    pass
+        if os.path.exists(temp_full):
+            try:
+                os.remove(temp_full)
+            except:
+                pass
+        if os.path.exists(concat_txt_path):
+            try:
+                os.remove(concat_txt_path)
+            except:
+                pass
+                    
+    return output_path
+
+def clean_bangla_title(title):
+    if not title:
+        return ""
+    # Remove brackets and contents inside them
+    cleaned = re.sub(r'[\(\[\{].*?[\)\]\}]', '', title)
+    # Remove common promotional words
+    cleaned = re.sub(r'(?i)bangla|new|natok|drama|shorts|clip|video|remastered|hd|4k|202\d|203\d', '', cleaned)
+    # Replace separators with space
+    cleaned = re.sub(r'\||:|–|-|—', ' ', cleaned)
+    # Filter words to keep Bengali or alphanumeric
+    words = cleaned.split()
+    cleaned_words = []
+    for w in words:
+        if any('\u0980' <= c <= '\u09ff' for c in w) or any(c.isalnum() for c in w):
+            cleaned_words.append(w)
+    result = " ".join(cleaned_words).strip()
+    return result if result else title
+
+def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=2.0):
+    """
+    Face-tracking crop helper.
+
+    Samples downscaled frames from the video (hflipped, so coordinates match
+    the crop-chain orientation), detects the dominant face with OpenCV Haar
+    cascades, smooths the position track and writes an ffmpeg sendcmd
+    commands file that drives the crop filter's x/y so the crop window
+    follows the face.
+
+    Returns the commands file path, or None when tracking is not possible
+    (OpenCV missing, no stable face found, or any error) — the caller then
+    keeps the static center crop.
+    """
+    try:
+        import cv2
+    except Exception as e:
+        print(f"[face-track] OpenCV unavailable ({e}); keeping static center crop")
+        return None
+
+    tmp_path = None
+    try:
+        set_ffmpeg_path()
+
+        clip = VideoFileClip(input_path)
+        try:
+            src_w, src_h = clip.size
+            duration = clip.duration
+        finally:
+            clip.close()
+        if not src_w or not src_h or not duration or duration < 1.0:
+            return None
+
+        # Mirror of the crop window sizes used by the ffmpeg crop filters below
+        if is_short:
+            crop_w = min(src_w, src_h * 9 / 16)
+            crop_h = min(src_h, src_w * 16 / 9)
+        else:
+            crop_w = src_w / 1.09
+            crop_h = src_h / 1.09
+
+        track_x = crop_w < src_w - 4      # room to slide horizontally
+        track_y = (not is_short) and crop_h < src_h - 4
+        if not track_x and not track_y:
+            return None  # window already covers the frame; nothing to follow
+
+        # Detect on small hflipped frames (hflip matches the processing chain)
+        sample_w = 320
+        sample_h = max(2, int(round(src_h * sample_w / src_w / 2.0)) * 2)
+        sample_cmd = [
+            "ffmpeg", "-v", "error",
+            "-i", input_path,
+            "-vf", f"hflip,fps={sample_fps},scale={sample_w}:{sample_h}",
+            "-pix_fmt", "bgr24",
+            "-f", "rawvideo", "pipe:1",
+        ]
+        proc = subprocess.Popen(sample_cmd, stdout=subprocess.PIPE)
+        frame_bytes = sample_w * sample_h * 3
+        frontal = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+
+        centers = []  # (cx, cy) in 0..1; None while no face seen yet
+        while True:
+            buf = proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
+                break
+            frame = np.frombuffer(buf, np.uint8).reshape(sample_h, sample_w, 3)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = frontal.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5, minSize=(24, 24))
+            if len(faces) == 0:
+                faces = profile.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(24, 24))
+            if len(faces) > 0:
+                fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+                centers.append(((fx + fw / 2) / sample_w, (fy + fh / 2) / sample_h))
+            else:
+                centers.append(None)
+        proc.stdout.close()
+        proc.wait()
+
+        n = len(centers)
+        found = sum(1 for c in centers if c is not None)
+        if n == 0 or found < max(2, int(n * 0.25)):
+            print(f"[face-track] No stable face ({found}/{n} samples); keeping static center crop")
+            return None
+
+        # Fill gaps: carry the last seen position forward (leading gaps backfill
+        # with the first seen position)
+        first = next(c for c in centers if c is not None)
+        xs, ys = [], []
+        last = first
+        for c in centers:
+            if c is not None:
+                last = c
+            xs.append(last[0])
+            ys.append(last[1])
+
+        # Desired crop offsets in source pixels for every sample
+        def targets(rel_x, rel_y):
+            tx = rel_x * src_w - crop_w / 2
+            ty = rel_y * src_h - crop_h / 2
+            return (
+                min(max(tx, 0), src_w - crop_w),
+                min(max(ty, 0), src_h - crop_h),
+            )
+
+        txs, tys = zip(*[targets(x, y) for x, y in zip(xs, ys)])
+
+        def smooth(vals, max_step):
+            # Follow the target with a per-sample speed limit so the crop
+            # window pans gently instead of jumping
+            out = []
+            prev = vals[0]
+            for v in vals:
+                prev += max(-max_step, min(max_step, v - prev))
+                out.append(prev)
+            # 3-sample moving average to round off the corners
+            sm = []
+            for i in range(len(out)):
+                a = max(0, i - 1)
+                b = min(len(out), i + 2)
+                sm.append(sum(out[a:b]) / (b - a))
+            return sm
+
+        sm_x = smooth(list(txs), max(6.0, crop_w * 0.12))
+        sm_y = smooth(list(tys), max(6.0, crop_h * 0.12))
+
+        # sendcmd works on the OUTPUT timeline (crop sits after setpts=PTS/speed)
+        # START-only commands: each sets the crop offset once and it persists
+        # until the next command overwrites it
+        out_dur = duration / speed_factor
+        lines = []
+        for i in range(n):
+            t0 = min(i / sample_fps / speed_factor, out_dur)
+            if track_x:
+                x_px = int(round(min(max(sm_x[i], 0), src_w - crop_w)))
+                lines.append(f"{t0:.3f} crop x {x_px};")
+            if track_y:
+                y_px = int(round(min(max(sm_y[i], 0), src_h - crop_h)))
+                lines.append(f"{t0:.3f} crop y {y_px};")
+        if not lines:
+            return None
+
+        fd, tmp_path = tempfile.mkstemp(prefix="face_cmds_", suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"[face-track] Face on {found}/{n} samples → crop follows the face ({tmp_path})")
+        return tmp_path
+    except Exception as e:
+        print(f"[face-track] Tracking failed ({e}); keeping static center crop")
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return None
+
+
+def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_dir="assets/audio", mix_bgm=True, video_title=None, thumb_path=None, srt_path=None, intro_path=None, outro_path=None, avatar_path=None, narration_path=None):
+    """
+    Apply hard-level copyright bypass filters using synced FFmpeg commands:
+    1. Horizontal Mirror (hflip).
+    2. Vibrant color filter (eq).
+    3. Speed up (1.04x) for the video.
+    4. Zoom-in (1.05x) and crop to bypass structural comparison.
+    5. Keep original dialogue/vocals while removing low-frequency/high-frequency background music.
+    6. Overlay and mix custom BGM track.
+    7. Crop to vertical 9:16 for Shorts.
+    8. Prepend thumbnail image as first 1.5s of the video (optional).
+    """
+    set_ffmpeg_path()
+    
+    f_bangla = get_best_font_path("bangla")
+    f_english = get_best_font_path("english")
+    watermark_text = os.environ.get("WATERMARK_TEXT", "Tawhidul official")
+    
+    # Get random BGM file
+    bgm_files = []
+    if os.path.exists(bgm_dir):
+        bgm_files = [
+            os.path.join(bgm_dir, f) 
+            for f in os.listdir(bgm_dir) 
+            if f.endswith(".mp3") and f != "bgm_combined.mp3" and not f.startswith("outro_")
+        ]
+    
+    bgm_path = random.choice(bgm_files) if bgm_files else None
+    
+    # Check if the input file has an audio track and get exact duration
+    has_audio = True
+    duration = 30.0
+    try:
+        clip = VideoFileClip(input_path)
+        duration = clip.duration
+        has_audio = clip.audio is not None
+        clip.close()
+    except Exception:
+        has_audio = True
+        
+    encoder, encoder_args = get_best_encoder()
+
+
+    # Randomize bypass factors for 0% copyright matching (changes fingerprint hash on every single run)
+    # Using subtle pitch shift for both shorts and long videos to maintain crystal clear voice quality
+    speed_factor = random.uniform(1.045, 1.055)
+    # Modified AI Voice Changer Filter (shifts pitch up or down distinctly to change vocal timber)
+    if random.choice([True, False]):
+        pitch_factor = random.uniform(1.12, 1.18)  # High-pitched AI voice filter
+    else:
+        pitch_factor = random.uniform(0.82, 0.87)  # Deep-pitched AI voice filter
+    tempo_factor = speed_factor / pitch_factor
+
+    # ── Face tracking: build a sendcmd file so the crop window follows the face ──
+    face_cmd_file = compute_face_sendcmd_file(input_path, speed_factor, is_short)
+    face_cmd_prefix = f"sendcmd=f='{face_cmd_file}'," if face_cmd_file else ""
+    
+    # Randomize EQ values per run for viral cinematic drama style (high contrast, warm skin tones, vibrant saturation)
+    rand_contrast = round(random.uniform(1.12, 1.20), 3)
+    rand_brightness = round(random.uniform(0.010, 0.020), 3)
+    rand_saturation = round(random.uniform(1.25, 1.35), 3)
+    
+    # Rich cinematic drama skin-tone and shadow balance (Teal & Orange grading)
+    rand_rs = round(random.uniform(-0.05, -0.02), 3)
+    rand_gs = round(random.uniform(-0.02, 0.0), 3)
+    rand_bs = round(random.uniform(0.03, 0.06), 3)
+    
+    rand_rm = round(random.uniform(0.05, 0.09), 3)
+    rand_gm = round(random.uniform(-0.01, 0.02), 3)
+    rand_bm = round(random.uniform(-0.08, -0.04), 3)
+    
+    # Highlights (glowing clear faces)
+    rand_rh = round(random.uniform(0.04, 0.08), 3)
+    rand_gh = round(random.uniform(0.0, 0.03), 3)
+    rand_bh = round(random.uniform(-0.06, -0.02), 3)
+
+    # Formulate filter_complex
+    cleaned_title = ""
+    if video_title:
+        cleaned_title = clean_bangla_title(video_title)
+        
+    display_title = f"Part-1 | {cleaned_title}" if cleaned_title else ""
+    # Shape Bengali characters for correct rendering in FreeType/FFmpeg
+    display_title = shape_bengali(display_title)
+    display_title = display_title.replace(":", "\\:").replace("'", "").replace("\"", "")
+    
+    title_overlay = ""
+    if display_title:
+        if is_short:
+            # Clean static text overlay in greenyellow color
+            title_overlay = f",drawtext=text='{display_title}':x=(w-tw)/2:y=240:fontsize=96:fontcolor=greenyellow:bordercolor=black:borderw=8:fontfile='{f_bangla}'"
+        else:
+            # Keep yellow title bar only for long compilation videos
+            title_overlay = f",drawtext=text='{display_title}':x=(w-tw)/2:y=h-160:fontsize=90:fontcolor=yellow:bordercolor=black:borderw=6:fontfile='{f_bangla}'"
+    # Generate snow overlay if is_short
+    has_snow = False
+    snow_path = None
+    if is_short:
+        try:
+            snow_path = ensure_snow_overlay()
+            if snow_path and os.path.exists(snow_path):
+                has_snow = True
+        except Exception as e:
+            print(f"[Warning] Failed to generate snow overlay: {e}")
+
+    # Dynamically build inputs and keep track of their indices
+    cmd_inputs = []
+    
+    # Input 0: Main video
+    cmd_inputs += ["-i", input_path]
+    main_idx = 0
+    inputs_count = 1
+    
+    bgm_idx = -1
+    snow_idx = -1
+    thumb_idx = -1
+    
+    # Input: BGM
+    has_bgm = bool(bgm_path and os.path.exists(bgm_path) and mix_bgm)
+    if has_bgm:
+        bgm_start_ss = random.choice([30, 35, 40, 45, 50])
+        cmd_inputs += ["-stream_loop", "-1", "-ss", str(bgm_start_ss), "-i", bgm_path]
+        bgm_idx = inputs_count
+        inputs_count += 1
+        
+    # Input: Snow overlay
+    if has_snow:
+        cmd_inputs += ["-stream_loop", "-1", "-i", snow_path]
+        snow_idx = inputs_count
+        inputs_count += 1
+        
+    # Input: Thumbnail image
+    has_thumb = bool(thumb_path and os.path.exists(thumb_path))
+    if has_thumb:
+        cmd_inputs += ["-loop", "1", "-t", "1.5", "-i", thumb_path]
+        thumb_idx = inputs_count
+        inputs_count += 1
+
+    # Input: Custom Intro Voiceover
+    intro_idx = -1
+    has_intro = bool(intro_path and os.path.exists(intro_path))
+    if has_intro:
+        cmd_inputs += ["-i", intro_path]
+        intro_idx = inputs_count
+        inputs_count += 1
+
+    # Input: Custom Outro Voiceover
+    outro_idx = -1
+    has_outro = bool(outro_path and os.path.exists(outro_path))
+    if has_outro:
+        cmd_inputs += ["-i", outro_path]
+        outro_idx = inputs_count
+        inputs_count += 1
+
+    # Input: Custom Avatar Logo
+    avatar_idx = -1
+    has_avatar = bool(avatar_path and os.path.exists(avatar_path))
+    if has_avatar:
+        cmd_inputs += ["-i", avatar_path]
+        avatar_idx = inputs_count
+        inputs_count += 1
+        
+    # Input: AI Narration Voiceover
+    narration_idx = -1
+    has_narration = bool(narration_path and os.path.exists(narration_path))
+    if has_narration:
+        cmd_inputs += ["-i", narration_path]
+        narration_idx = inputs_count
+        inputs_count += 1
+
+    # Load outro duration if present
+    outro_duration = 0.0
+    delay_ms = 0
+    if has_outro:
+        try:
+            from moviepy import AudioFileClip
+            o_clip = AudioFileClip(outro_path)
+            outro_duration = o_clip.duration
+            o_clip.close()
+            # Calculate output duration and delay based on speed factor
+            output_duration = duration / speed_factor
+            delay_sec = max(0, output_duration - outro_duration)
+            delay_ms = int(delay_sec * 1000)
+        except Exception as e:
+            print(f"[Warning] Failed to load outro file duration: {e}")
+            delay_ms = int(max(0, (duration / speed_factor) - 5) * 1000)
+
+    # ── Build filter_complex and map arguments ───────────────────────────────
+    # IMPORTANT: FFmpeg concat filter with n=2:v=1:a=1 requires exactly 4 inputs:
+    #   [v_seg1][a_seg1][v_seg2][a_seg2]concat=n=2:v=1:a=1[v][a]
+    # When has_thumb=True we must include BOTH the thumb audio AND main audio
+    # INSIDE the same filter_complex so concat gets all 4 streams.
+    # When has_thumb=False we use the simpler separate v_filter/a_filter approach.
+
+    def build_filter_with_thumb(enc, enc_args):
+        """Build a single unified filter_complex that prepends the thumbnail."""
+        parts = []
+
+        # ── Thumbnail video ─────────────────────────────────────────────────
+        if is_short:
+            parts.append(f"[{thumb_idx}:v]scale=1080:1920,setsar=1[v_t]")
+        else:
+            parts.append(f"[{thumb_idx}:v]scale=3840:2160,setsar=1[v_t]")
+
+        # Thumbnail silent audio (1.5 s, stereo 44100 Hz)
+        parts.append("aevalsrc=0:c=stereo:s=44100:d=1.5[a_t]")
+
+        avatar_sz = 220 if is_short else 300
+        # ── Main video ──────────────────────────────────────────────────────
+        if is_short:
+            v_main = (
+                f"[{main_idx}:v]hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
+                f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
+                f"{face_cmd_prefix}crop='min(iw,ih*9/16):min(ih,iw*16/9):(iw-ow)/2:(ih-oh)/2',scale=1080:1920:flags=lanczos"
+                f"{title_overlay}[v_main_raw]"
+            )
+            parts.append(v_main)
+        else:
+            # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
+            parts.append(
+                f"[{main_idx}:v]hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
+                f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
+                f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
+                f"[v_split2]{face_cmd_prefix}crop=w='trunc(iw/1.09/2)*2':h='trunc(ih/1.09/2)*2':x='(iw-ow)/2':y='(ih-oh)/2',"
+                f"scale=3456:1944[v_fg];"
+                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,"
+                f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
+                f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
+                f"{title_overlay}[v_main_raw]"
+            )
+            
+        v_main_name = "[v_main_raw]"
+        if has_avatar:
+            r = avatar_sz // 2
+            parts.append(f"[{avatar_idx}:v]scale={avatar_sz}:{avatar_sz},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-{r},Y-{r}),{r}),255,0)'[avatar_round]")
+            pad = 60 if is_short else 100
+            parts.append(f"{v_main_name}[avatar_round]overlay=x={pad}:y={pad}[v_main_p]")
+        else:
+            parts.append(f"{v_main_name}format=yuv420p[v_main_p]")
+
+        # ── Main audio (Crystal clear AI/Studio voice with background noise cancellation) ─────────────────
+        if is_short:
+            audio_eq = (
+                f"[{main_idx}:a]afftdn=noise_reduction=10,aresample=44100,"
+                f"highpass=f=200,lowpass=f=3500,"
+                f"equalizer=f=120:width_type=h:width=50:g=2.0,"
+                f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
+                f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
+                f"asetrate=44100*{pitch_factor:.4f},aresample=44100,asetpts=N/SR/TB,"
+                f"atempo={tempo_factor:.4f},volume=1.35"
+            )
+            bgm_vol_val = 0.28
+        else:
+            # Flawless crystal clear audio settings for long compilation videos matching Shorts
+            audio_eq = (
+                f"[{main_idx}:a]afftdn=noise_reduction=10,aresample=44100,"
+                f"highpass=f=200,lowpass=f=3500,"
+                f"equalizer=f=120:width_type=h:width=50:g=2.0,"
+                f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
+                f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
+                f"asetrate=44100*{pitch_factor:.4f},aresample=44100,asetpts=N/SR/TB,"
+                f"atempo={tempo_factor:.4f},volume=1.35"
+            )
+            bgm_vol_val = 0.28
+        if has_audio:
+            parts.append(f"{audio_eq}[a_eq]")
+            current_dialogue = "[a_eq]"
+            
+            if has_intro:
+                parts.append(f"[{intro_idx}:a]asetpts=N/SR/TB,volume=1.8[intro_vol]")
+                parts.append(f"{current_dialogue}[intro_vol]amix=inputs=2:duration=first:normalize=0[diag_intro]")
+                current_dialogue = "[diag_intro]"
+                
+            if has_narration:
+                parts.append(f"[{narration_idx}:a]asetpts=N/SR/TB,volume=1.5[narr_vol]")
+                parts.append(f"{current_dialogue}volume=0.35[orig_bg]")
+                parts.append(f"[orig_bg][narr_vol]amix=inputs=2:duration=first:normalize=0[diag_narr]")
+                current_dialogue = "[diag_narr]"
+                
+            if has_outro:
+                parts.append(f"[{outro_idx}:a]asetpts=N/SR/TB,adelay={delay_ms}|{delay_ms},volume=1.8[outro_vol]")
+                parts.append(f"{current_dialogue}[outro_vol]amix=inputs=2:duration=first:normalize=0[diag_outro]")
+                current_dialogue = "[diag_outro]"
+                
+            if has_bgm:
+                parts.append(f"[{bgm_idx}:a]asetpts=N/SR/TB,volume={bgm_vol_val}[bgm_vol]")
+                parts.append(f"{current_dialogue}[bgm_vol]amix=inputs=2:duration=first[a_main_out]")
+            else:
+                parts.append(f"{current_dialogue}acopy[a_main_out]")
+        else:
+            # No audio track — use BGM only, or silence
+            if has_bgm:
+                parts.append(f"[{bgm_idx}:a]asetpts=N/SR/TB,volume=0.80[a_main_out]")
+            else:
+                parts.append("aevalsrc=0:c=stereo:s=44100[a_main_out]")
+
+        # ── Concat thumbnail + main  (video + audio streams) ────────────────
+        # concat n=2:v=1:a=1 needs: [v_t][a_t][v_main_p][a_main_out]
+        v_main_final = "[v_main_p]"
+        if srt_path and os.path.exists(srt_path):
+            escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+            margin = 200 if is_short else 80
+            font_sz = 64 if is_short else 24
+            sub_filter = f"[v_main_p]subtitles='{escaped_srt}':force_style='Alignment=2,MarginV={margin},OutlineColour=&H000000,BorderStyle=3,Outline=3,Shadow=0,Fontname=Arial,Fontsize={font_sz},PrimaryColour=&H00FFFF'[v_main_sub]"
+            parts.append(sub_filter)
+            v_main_final = "[v_main_sub]"
+        parts.append(f"[v_t][a_t]{v_main_final}[a_main_out]concat=n=2:v=1:a=1[v][a]")
+
+        filter_str = "; ".join(parts)
+        cmd = ["ffmpeg", "-y", "-threads", "0", "-sws_flags", "lanczos"]
+        cmd += cmd_inputs
+        cmd += ["-filter_complex", filter_str, "-map", "[v]", "-map", "[a]", "-c:a", "aac"]
+        if has_bgm:
+            cmd += ["-shortest"]
+        cmd += ["-c:v", enc] + enc_args + [output_path]
+        return cmd
+
+    def build_command(enc, enc_args):
+        """Build command without thumbnail (or delegate to thumb builder)."""
+        if has_thumb:
+            return build_filter_with_thumb(enc, enc_args)
+
+        avatar_sz = 220 if is_short else 300
+        # ── No-thumbnail path (unchanged logic) ────────────────────────────
+        # v_filter / a_filter are only used here
+        vf_parts = []
+        if is_short:
+            v_main = (
+                f"[{main_idx}:v]hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
+                f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
+                f"{face_cmd_prefix}crop='min(iw,ih*9/16):min(ih,iw*16/9):(iw-ow)/2:(ih-oh)/2',scale=1080:1920:flags=lanczos"
+                f"{title_overlay}"
+            )
+        else:
+            # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
+            v_main = (
+                f"[{main_idx}:v]hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
+                f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
+                f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
+                f"[v_split2]{face_cmd_prefix}crop=w='trunc(iw/1.09/2)*2':h='trunc(ih/1.09/2)*2':x='(iw-ow)/2':y='(ih-oh)/2',"
+                f"scale=3456:1944[v_fg];"
+                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,"
+                f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
+                f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
+                f"{title_overlay}"
+            )
+            
+        vf_parts.append(f"{v_main}[v_raw]")
+        current_v = "[v_raw]"
+        
+        if has_avatar:
+            r = avatar_sz // 2
+            pad = 60 if is_short else 100
+            vf_parts.append(f"[{avatar_idx}:v]scale={avatar_sz}:{avatar_sz},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-{r},Y-{r}),{r}),255,0)'[avatar_round]")
+            vf_parts.append(f"{current_v}[avatar_round]overlay=x={pad}:y={pad}[v_avatar]")
+            current_v = "[v_avatar]"
+            
+        vf_parts.append(f"{current_v}format=yuv420p[v]")
+        no_thumb_vf = "; ".join(vf_parts)
+
+        if srt_path and os.path.exists(srt_path):
+            escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+            margin = 600 if is_short else 80
+            font_sz = 64 if is_short else 24
+            no_thumb_vf = no_thumb_vf.replace("[v]", "[v_nosub]")
+            no_thumb_vf += f"; [v_nosub]subtitles='{escaped_srt}':force_style='Alignment=2,MarginV={margin},OutlineColour=&H000000,BorderStyle=3,Outline=3,Shadow=0,Fontname=Arial,Fontsize={font_sz},PrimaryColour=&H00FFFF'[v]"
+
+        if is_short:
+            audio_eq_no_thumb = (
+                f"[{main_idx}:a]afftdn=noise_reduction=10,aresample=44100,"
+                f"highpass=f=200,lowpass=f=3500,"
+                f"equalizer=f=120:width_type=h:width=50:g=2.0,equalizer=f=3000:width_type=h:width=1000:g=2.0,"
+                f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,asetrate=44100*{pitch_factor:.4f},aresample=44100,"
+                f"asetpts=N/SR/TB,atempo={tempo_factor:.4f},volume=1.35"
+            )
+            bgm_vol_val = 0.28
+        else:
+            audio_eq_no_thumb = (
+                f"[{main_idx}:a]afftdn=noise_reduction=10,aresample=44100,"
+                f"highpass=f=200,lowpass=f=3500,"
+                f"equalizer=f=120:width_type=h:width=50:g=2.0,equalizer=f=3000:width_type=h:width=1000:g=2.0,"
+                f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,asetrate=44100*{pitch_factor:.4f},aresample=44100,"
+                f"asetpts=N/SR/TB,atempo={tempo_factor:.4f},volume=1.35"
+            )
+            bgm_vol_val = 0.28
+
+        if has_bgm and has_audio:
+            parts_nt = []
+            parts_nt.append(f"{audio_eq_no_thumb}[a_eq]")
+            current_a = "[a_eq]"
+            
+            if has_intro:
+                parts_nt.append(f"[{intro_idx}:a]asetpts=N/SR/TB,volume=1.8[intro_vol]")
+                parts_nt.append(f"{current_a}[intro_vol]amix=inputs=2:duration=first:normalize=0[diag_intro]")
+                current_a = "[diag_intro]"
+                
+            if has_narration:
+                parts_nt.append(f"[{narration_idx}:a]asetpts=N/SR/TB,volume=1.5[narr_vol]")
+                parts_nt.append(f"{current_a}volume=0.35[orig_bg]")
+                parts_nt.append(f"[orig_bg][narr_vol]amix=inputs=2:duration=first:normalize=0[diag_narr]")
+                current_a = "[diag_narr]"
+                
+            if has_outro:
+                parts_nt.append(f"[{outro_idx}:a]asetpts=N/SR/TB,adelay={delay_ms}|{delay_ms},volume=1.8[outro_vol]")
+                parts_nt.append(f"{current_a}[outro_vol]amix=inputs=2:duration=first:normalize=0[diag_outro]")
+                current_a = "[diag_outro]"
+                
+            parts_nt.append(f"[{bgm_idx}:a]asetpts=N/SR/TB,volume={bgm_vol_val}[bgm_vol]")
+            parts_nt.append(f"{current_a}[bgm_vol]amix=inputs=2:duration=first[a]")
+            no_thumb_af = "; ".join(parts_nt)
+        elif has_audio:
+            parts_nt = []
+            parts_nt.append(f"{audio_eq_no_thumb}[a_eq]")
+            current_a = "[a_eq]"
+            
+            if has_intro:
+                parts_nt.append(f"[{intro_idx}:a]asetpts=N/SR/TB,volume=1.8[intro_vol]")
+                parts_nt.append(f"{current_a}[intro_vol]amix=inputs=2:duration=first:normalize=0[diag_intro]")
+                current_a = "[diag_intro]"
+                
+            if has_narration:
+                parts_nt.append(f"[{narration_idx}:a]asetpts=N/SR/TB,volume=1.5[narr_vol]")
+                parts_nt.append(f"{current_a}volume=0.35[orig_bg]")
+                parts_nt.append(f"[orig_bg][narr_vol]amix=inputs=2:duration=first:normalize=0[diag_narr]")
+                current_a = "[diag_narr]"
+                
+            if has_outro:
+                parts_nt.append(f"[{outro_idx}:a]asetpts=N/SR/TB,adelay={delay_ms}|{delay_ms},volume=1.8[outro_vol]")
+                parts_nt.append(f"{current_a}[outro_vol]amix=inputs=2:duration=first:normalize=0[diag_outro]")
+                current_a = "[diag_outro]"
+                
+            parts_nt.append(f"{current_a}acopy[a]")
+            no_thumb_af = "; ".join(parts_nt)
+        elif has_bgm:
+            no_thumb_af = f"[{bgm_idx}:a]asetpts=N/SR/TB,volume=0.80[a]"
+        else:
+            no_thumb_af = None
+
+        cmd = ["ffmpeg", "-y", "-threads", "0", "-sws_flags", "lanczos"]
+        cmd += cmd_inputs
+        if no_thumb_af:
+            cmd += ["-filter_complex", f"{no_thumb_vf};{no_thumb_af}", "-map", "[v]", "-map", "[a]", "-c:a", "aac"]
+            if has_bgm:
+                cmd += ["-shortest"]
+        else:
+            cmd += ["-filter_complex", no_thumb_vf, "-map", "[v]"]
+        cmd += ["-c:v", enc] + enc_args + [output_path]
+        return cmd
+
+    def build_command_no_thumb(enc, enc_args):
+        """Fallback: same pipeline with the thumbnail input disabled.
+
+        The unified thumb filter_complex (thumbnail concat + main video) can
+        fail on some streams/encoders; this re-runs the no-thumb branch of
+        build_command instead of it.
+        """
+        nonlocal has_thumb
+        saved, has_thumb = has_thumb, False
+        try:
+            return build_command(enc, enc_args)
+        finally:
+            has_thumb = saved
+
+    def build_command_bare(enc, enc_args):
+        """Absolute minimum fallback: just speed + flip, no BGM, no thumb."""
+        if is_short:
+            v_f = (
+                f"[0:v]hflip,setpts=PTS/{speed_factor:.4f},"
+                f"{face_cmd_prefix}crop='min(iw,ih*9/16):min(ih,iw*16/9):(iw-ow)/2:(ih-oh)/2',scale=1080:1920:flags=lanczos[v]"
+            )
+        else:
+            # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
+            v_f = (
+                f"[0:v]hflip,unsharp=5:5:0.8:5:5:0.8,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
+                f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
+                f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
+                f"[v_split2]{face_cmd_prefix}crop=w='trunc(iw/1.09/2)*2':h='trunc(ih/1.09/2)*2':x='(iw-ow)/2':y='(ih-oh)/2',"
+                f"scale=3456:1944[v_fg];"
+                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1[v]"
+            )
+
+        cmd = ["ffmpeg", "-y", "-threads", "0",
+               "-i", input_path]
+        if has_audio:
+            if is_short:
+                a_f_bare = (
+                    f"[0:a]afftdn=noise_reduction=10,aresample=44100,"
+                    f"equalizer=f=120:width_type=h:width=50:g=2.0,"
+                    f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
+                    f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
+                    f"asetrate=44100*{pitch_factor:.4f},aresample=44100,asetpts=N/SR/TB,"
+                    f"atempo={tempo_factor:.4f},volume=1.20[a]"
+                )
+            else:
+                a_f_bare = (
+                    f"[0:a]afftdn=noise_reduction=10,aresample=44100,"
+                    f"equalizer=f=120:width_type=h:width=50:g=2.0,"
+                    f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
+                    f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
+                    f"asetrate=44100*{pitch_factor:.4f},aresample=44100,asetpts=N/SR/TB,"
+                    f"atempo={tempo_factor:.4f},volume=1.20[a]"
+                )
+            cmd += ["-filter_complex", f"{v_f};{a_f_bare}", "-map", "[v]", "-map", "[a]", "-c:a", "aac"]
+        else:
+            cmd += ["-filter_complex", v_f, "-map", "[v]"]
+        cmd += ["-c:v", enc] + enc_args + [output_path]
+        return cmd
+ 
+
+    # ── Try all fallback levels ────────────────────────────────────────────────
+    fallback_levels = [
+        ("Full pipeline",          lambda: build_command(encoder, encoder_args)),
+        ("libx264 full",           lambda: build_command("libx264", ["-preset", "superfast"])),
+        ("libx264 no-thumbnail",   lambda: build_command_no_thumb("libx264", ["-preset", "superfast"])),
+        ("libx264 bare-minimum",   lambda: build_command_bare("libx264", ["-preset", "superfast"])),
+    ]
+
+    try:
+        last_err = None
+        for level_name, cmd_fn in fallback_levels:
+            cmd = cmd_fn()
+            print(f"[FFmpeg] Trying: {level_name}")
+            try:
+                subprocess.run(cmd, check=True)
+                print(f"[FFmpeg] ✓ Success with: {level_name}")
+                if level_name != "Full pipeline":
+                    # Reset encoder cache so next run tries hardware again
+                    global _encoder_cache
+                    _encoder_cache = None
+                return output_path
+            except subprocess.CalledProcessError as e:
+                last_err = e
+                print(f"[FFmpeg] ✗ Failed ({level_name}, status {e.returncode}). Trying next fallback...")
+                # Remove broken output if it exists
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except Exception:
+                        pass
+
+        raise RuntimeError(f"All FFmpeg fallback levels failed. Last error: {last_err}")
+    finally:
+        if face_cmd_file and os.path.exists(face_cmd_file):
+            try:
+                os.remove(face_cmd_file)
+            except Exception:
+                pass
+
+def compress_video_if_needed(input_path, max_size_mb=44):
+    """
+    Compress video using target bitrates to ensure it fits under the Telegram file transfer limit (50MB).
+    Scales resolution down to 480p to fit sizing.
+    """
+    set_ffmpeg_path()
+    
+    file_size = os.path.getsize(input_path)
+    file_size_mb = file_size / (1024 * 1024)
+    print(f"Video size before compression: {file_size_mb:.2f} MB")
+    
+    if file_size_mb <= max_size_mb:
+        return input_path
+        
+    print(f"Video size {file_size_mb:.2f} MB exceeds {max_size_mb} MB limit. Compressing...")
+    
+    # Get video details using VideoFileClip
+    duration = 600 # default
+    is_vertical = False
+    is_square = False
+    try:
+        clip = VideoFileClip(input_path)
+        duration = clip.duration
+        w, h = clip.size
+        if abs(w - h) < 5:
+            is_square = True
+        else:
+            is_vertical = (w < h)
+        clip.close()
+    except Exception as e:
+        print(f"Error getting clip details: {e}")
+        
+    # Calculate target bitrate: total bits / duration
+    target_total_bitrate = (max_size_mb * 1024 * 1024 * 8) / duration # bits per second
+    audio_bitrate = 64 * 1024 # 64kbps
+    video_bitrate = int(target_total_bitrate - audio_bitrate)
+    
+    # Keep video_bitrate in acceptable bounds (allow high quality up to 4 Mbps for short videos/shorts)
+    video_bitrate = max(200000, min(4000000, video_bitrate))
+    
+    output_path = input_path.replace(".mp4", "_compressed.mp4")
+    
+    encoder, encoder_args = get_best_encoder()
+    
+    # Clean encoder_args to remove quality overriding parameters (-q:v, -q, -crf) for target bitrate mode
+    clean_encoder_args = []
+    i = 0
+    while i < len(encoder_args):
+        arg = encoder_args[i]
+        if arg in ["-q:v", "-q", "-crf"]:
+            i += 2
+        else:
+            clean_encoder_args.append(arg)
+            i += 1
+            
+    # Dynamically select resolution based on video bitrate to prevent blocky artifacts
+    if is_square:
+        if video_bitrate < 400000:
+            scale_size = "480x480"
+        elif video_bitrate < 700000:
+            scale_size = "720x720"
+        elif video_bitrate < 1200000:
+            scale_size = "1080x1080"
+        else:
+            scale_size = "1440x1440"
+    else:
+        if video_bitrate < 400000:
+            scale_size = "360x640" if is_vertical else "640x360"
+        elif video_bitrate < 700000:
+            scale_size = "480x854" if is_vertical else "854x480"
+        elif video_bitrate < 1200000:
+            scale_size = "720x1280" if is_vertical else "1280x720"
+        else:
+            scale_size = "1080x1920" if is_vertical else "1920x1080"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-b:v", f"{video_bitrate}",
+        "-s", scale_size,
+        "-b:a", "64k",
+        "-c:v", encoder,
+    ] + clean_encoder_args + [
+        "-c:a", "aac",
+        output_path
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        if encoder != "libx264":
+            print(f"[Warning] Compression failed with encoder '{encoder}': {e}. Retrying with libx264...")
+            global _encoder_cache
+            _encoder_cache = ("libx264", ["-preset", "superfast"])
+            encoder, encoder_args = _encoder_cache
+            clean_encoder_args = ["-preset", "superfast"]
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-b:v", f"{video_bitrate}",
+                "-s", scale_size,
+                "-b:a", "64k",
+                "-c:v", encoder,
+            ] + clean_encoder_args + [
+                "-c:a", "aac",
+                output_path
+            ]
+            try:
+                subprocess.run(cmd, check=True)
+            except Exception as fallback_err:
+                print(f"Compression fallback failed: {fallback_err}")
+                return input_path
+        else:
+            print(f"Compression failed: {e}")
+            return input_path
+
+    if os.path.exists(output_path):
+        new_size = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"Compressed video size: {new_size:.2f} MB")
+        os.remove(input_path)
+        os.rename(output_path, input_path)
+        return input_path
+        
+    return input_path
+
+def mix_bgm_on_merged_video(video_path, output_path, bgm_dir="assets/audio", preferred_bgm=None):
+    """
+    Overlay a background music track on a video file that already contains dialogue.
+    If preferred_bgm is provided, it is used instead of a random track.
+    The original audio (dialogue) is kept at 100% volume, and BGM is mixed at 22% volume.
+    """
+    import shutil
+    import random
+    set_ffmpeg_path()
+    
+    bgm_path = None
+    if preferred_bgm:
+        potential_path = os.path.join(bgm_dir, preferred_bgm)
+        if os.path.exists(potential_path):
+            bgm_path = potential_path
+            
+    if not bgm_path:
+        bgm_files = []
+        if os.path.exists(bgm_dir):
+            bgm_files = [
+                os.path.join(bgm_dir, f) 
+                for f in os.listdir(bgm_dir) 
+                if f.endswith(".mp3") and f != "bgm_combined.mp3" and not f.startswith("outro_")
+            ]
+        bgm_path = random.choice(bgm_files) if bgm_files else None
+        
+    if not bgm_path or not os.path.exists(bgm_path):
+        shutil.copy(video_path, output_path)
+        return output_path
+        
+    # High-quality EQ/compression mixing for flawless crystal clear voice
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-stream_loop", "-1", "-ss", "30", "-i", bgm_path,
+        "-filter_complex", "[0:a]afftdn=noise_reduction=10,aresample=44100,highpass=f=200,lowpass=f=3500,equalizer=f=120:width_type=h:width=50:g=2.0,equalizer=f=3000:width_type=h:width=1000:g=2.0,asetpts=N/SR/TB,volume=1.35[orig];[1:a]asetpts=N/SR/TB,volume=0.28[bgm];[orig][bgm]amix=inputs=2:duration=first[a]",
+        "-map", "0:v", "-map", "[a]",
+        "-c:v", "copy", "-c:a", "aac",
+        "-shortest",
+        output_path
+    ]
+    print(f"Mixing BGM on merged video: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+    return output_path
+
+
+def ensure_snow_overlay():
+    import os
+    import math
+    import numpy as np
+    from PIL import Image, ImageDraw
+    
+    os.makedirs("assets", exist_ok=True)
+    snow_path = "assets/snow_overlay.mp4"
+    if os.path.exists(snow_path):
+        return snow_path
+        
+    print("Generating snow overlay asset...")
+    from moviepy import VideoClip
+    import imageio_ffmpeg
+    
+    w, h = 1080, 1920
+    duration = 15.0
+    fps = 24
+    
+    def make_frame(t):
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+        draw = ImageDraw.Draw(img)
+        
+        for idx in range(35): 
+            seed_x = (idx * 17.31) % 1.0
+            seed_y = (idx * 29.57) % 1.0
+            seed_speed = (idx * 13.93) % 1.0
+            seed_radius = (idx * 7.19) % 1.0
+            seed_phase = (idx * 3.47) % 1.0
+            
+            radius = int(5 + seed_radius * 12)  
+            x_center = seed_x * w
+            speed = 90 + seed_speed * 110       
+            
+            y = (seed_y * h + speed * t) % h
+            sway = 25 * math.sin(1.5 * t + seed_phase * 6.28)
+            x = (x_center + sway) % w
+            
+            alpha_val = int(100 + seed_speed * 125)
+            draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=(255, 255, 255, alpha_val))
+            
+            glow_rad = radius * 2
+            draw.ellipse([x - glow_rad, y - glow_rad, x + glow_rad, y + glow_rad], fill=(255, 255, 255, int(alpha_val * 0.25)))
+            
+        return np.array(img.convert("RGB"))
+        
+    clip = VideoClip(make_frame, duration=duration)
+    
+    clip.write_videofile(
+        snow_path,
+        fps=fps,
+        codec="libx264",
+        audio=False,
+        logger=None,
+        ffmpeg_params=["-pix_fmt", "yuv420p"]
+    )
+    clip.close()
+    return snow_path
+
+
+def extract_audio_from_video(video_path, audio_path):
+    """Extract lightweight mono audio from a video using ffmpeg."""
+    set_ffmpeg_path()
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-ab", "64k",
+        "-f", "mp3",
+        audio_path
+    ]
+    print(f"[Audio Extract] Running: {' '.join(cmd)}")
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return audio_path
+
+
+def generate_english_srt_from_audio(audio_path, category=None):
+    """
+    Upload the audio file to Google Gemini, transcribe/translate the Bengali speech to English,
+    and return subtitles in valid SRT format.
+    """
+    from gemini_helper import client, DEFAULT_MODEL
+    import time
+    
+    if not client:
+        print("[Gemini Translation] Client not available.")
+        return None
+        
+    category_str = f" ({category})" if category else ""
+    prompt = f"""
+    You are a professional video translation assistant.
+    You are given an audio file containing Bengali speech{category_str}.
+    
+    Your task is to:
+    1. Transcribe the Bengali speech and translate it into clear, natural, and idiomatic English.
+    2. Output standard SRT (SubRip Subtitle) format.
+    3. Ensure the subtitle timestamps perfectly align with the speech in the audio.
+    4. Keep subtitle lines short and readable (max 40 characters per line, up to 2 lines per subtitle block).
+    
+    Output ONLY valid SRT format. Do not include markdown code block syntax (like ```srt or ```), explanations, or notes.
+    """
+    
+    print(f"[Gemini Translation] Uploading audio file to Gemini: {audio_path}")
+    uploaded_file = None
+    try:
+        uploaded_file = client.files.upload(file=audio_path)
+        print(f"[Gemini Translation] File uploaded successfully as: {uploaded_file.name}. Waiting for processing...")
+        
+        # Wait for file processing if needed (normally fast for audio)
+        time.sleep(2)
+        
+        print("[Gemini Translation] Requesting transcription and translation...")
+        response = client.models.generate_content(
+            model=DEFAULT_MODEL,
+            contents=[uploaded_file, prompt]
+        )
+        
+        srt_text = response.text.strip()
+        # Clean up any markdown block wrappers if Gemini ignored the instruction
+        if "```srt" in srt_text:
+            srt_text = srt_text.split("```srt")[1].split("```")[0].strip()
+        elif "```" in srt_text:
+            srt_text = srt_text.split("```")[1].split("```")[0].strip()
+            
+        print(f"[Gemini Translation] Received subtitle text. Length: {len(srt_text)} characters.")
+        return srt_text
+        
+    except Exception as e:
+        print(f"[Gemini Translation] Error: {e}")
+        return None
+        
+    finally:
+        # Crucial: clean up the uploaded file from Gemini server to prevent quota/resource issues
+        if uploaded_file:
+            try:
+                client.files.delete(name=uploaded_file.name)
+                print(f"[Gemini Translation] Cleaned up file from Gemini server: {uploaded_file.name}")
+            except Exception as delete_err:
+                print(f"[Gemini Translation] Failed to delete file {uploaded_file.name}: {delete_err}")
+
+
+
