@@ -48,7 +48,7 @@ SYSTEM_INSTRUCTION_AUTO = (
 )
 
 class AIChatbot:
-    def __init__(self, model_name="gemini-2.5-flash", system_instruction=None, language="bangla"):
+    def __init__(self, model_name="gemini-3.5-flash", system_instruction=None, language="bangla"):
         self.model_name = model_name
         self.language = language  # "auto", "bangla", "english"
         self.system_instruction = system_instruction or self._get_instruction_for_language(language)

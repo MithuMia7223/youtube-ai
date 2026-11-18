@@ -7,12 +7,12 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ── Import helpers ────────────────────────────────────────────────────────────
-from gemini_helper import generate_script, generate_seo_meta, analyze_and_suggest_growth
+from gemini_helper import generate_script, generate_seo_meta, analyze_and_suggest_growth, generate_drama_script
 from youtube_helper import (
     get_auth_url, save_token_from_code,
     get_youtube_service, get_channel_stats, upload_video, upload_thumbnail
 )
-from video_creator import create_faceless_video, VOICE_LABELS, DEFAULT_VOICE
+from video_creator import create_faceless_video, create_drama_short_video, VOICE_LABELS, DEFAULT_VOICE
 from thumbnail_creator import create_thumbnail
 from scheduler_helper import (
     set_schedule, remove_schedule, get_schedule, get_all_schedules,
@@ -44,6 +44,7 @@ def get_session(chat_id: int) -> dict:
             'voice': DEFAULT_VOICE,
             'pending_topic': None,
             'pending_is_short': False,
+            'bgm_preference': None,
         }
     return user_sessions[chat_id]
 
@@ -56,30 +57,29 @@ def get_session(chat_id: int) -> dict:
 def send_welcome(message):
     chat_id = message.chat.id
     
-    # Create persistent menu buttons on user keyboard
+    # Create persistent menu buttons on user keyboard (Only Shorts & Long Video)
     from telebot.types import ReplyKeyboardMarkup, KeyboardButton
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     
-    btn_create   = KeyboardButton("🎬 Create Video")
-    btn_schedule = KeyboardButton("📅 Auto-Post Schedule")
-    btn_grow     = KeyboardButton("📊 Grow Channel")
+    btn_short = KeyboardButton("📱 Shorts ভিডিও ক্লিপ")
+    btn_long  = KeyboardButton("📺 লং ভিডিও ক্লিপ")
 
-    markup.add(btn_create, btn_schedule, btn_grow)
+    markup.add(btn_short, btn_long)
 
     text = """
-👋 *হ্যালো! আমি আপনার AI YouTube Bot!*
+👋 *হ্যালো! আমি আপনার YouTube AI Clipper Bot!*
 
-🤖 আমি আপনাকে সাহায্য করব:
-• AI দিয়ে আকর্ষণীয় ভিডিও তৈরি করতে
-• প্রতিদিন নির্দিষ্ট সময়ে অটো-পোস্ট করতে
-• আপনার ইউটিউব চ্যানেল গ্রো করতে সাহায্য করতে
+🤖 আমি আপনাকে সাহায্য করব যেকোনো ইউটিউব ভিডিওর লিংক থেকে কপিরাইট ফ্রি শর্টস বা লং ভিডিও ক্লিপ তৈরি করতে এবং তা সরাসরি আপনার চ্যানেলে আপলোড করতে।
 
 ━━━━━━━━━━━━━━━━━━━━
-👇 *নিচের বাটনগুলো ক্লিক করে কাজ শুরু করুন:*
+👇 *কাজ শুরু করতে নিচের বাটনগুলো ব্যবহার করুন:*
 ━━━━━━━━━━━━━━━━━━━━
+📱 *Shorts ভিডিও ক্লিপ* → YouTube ভিডিও থেকে শর্টস ক্লিপ তৈরি করো
+📺 *লং ভিডিও ক্লিপ* → YouTube ভিডিও থেকে লং ক্লিপ তৈরি করো
 ⚙️ *ইউটিউব কানেক্ট না থাকলে প্রথমে /auth লিখে কানেক্ট করুন।*
     """
     bot.send_message(chat_id, text, reply_markup=markup, parse_mode='Markdown')
+
 
 
 @bot.message_handler(commands=['help'])
@@ -173,6 +173,179 @@ def handle_short(message):
         return
 
     _start_video_creation(chat_id, topic, is_short=True)
+
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║          DRAMA (EMOTIONAL NATOK SHORTS)                  ║
+# ╚══════════════════════════════════════════════════════════╝
+
+@bot.message_handler(commands=['drama'])
+def handle_drama(message):
+    """Create a viral Bangla emotional drama short video."""
+    chat_id = message.chat.id
+    topic = message.text.replace('/drama', '').strip()
+
+    youtube = get_youtube_service()
+    if not youtube:
+        bot.send_message(chat_id, "❌ প্রথমে /auth দিয়ে YouTube Channel কানেক্ট করো।")
+        return
+
+    if not topic:
+        sent = bot.send_message(
+            chat_id,
+            "🎭 *ইমোশনাল নাটক শর্টস*\n\n"
+            "কোন বিষয় বা গল্পের উপর ইমোশনাল নাটক বানাতে চাও? টপিকটি লিখো:\n\n"
+            "*উদাহরণ:*\n"
+            "• ভাঙা ভালোবাসা\n"
+            "• মায়ের কষ্ট\n"
+            "• বন্ধুত্বের বিশ্বাসঘাতকতা\n"
+            "• সত্যিকারের ভালোবাসা",
+            parse_mode='Markdown'
+        )
+        bot.register_next_step_handler(
+            sent,
+            lambda m: _start_drama_creation(m.chat.id, m.text.strip())
+        )
+        return
+
+    _start_drama_creation(chat_id, topic)
+
+
+def _start_drama_creation(chat_id: int, topic: str):
+    """Launch drama video creation pipeline in background thread."""
+    if not topic or topic.startswith('/'):
+        bot.send_message(chat_id, "❌ বৈধ টপিক দাও।")
+        return
+
+    bot.send_message(
+        chat_id,
+        f"🎭 *ইমোশনাল নাটক শর্টস তৈরি শুরু হয়েছে!*\n\n"
+        f"📌 টপিক: *{topic}*\n\n"
+        f"⏳ পদক্ষেপ:\n"
+        f"1️⃣ Gemini AI দিয়ে বাংলা ইমোশনাল ডায়ালগ স্ক্রিপ্ট তৈরি হবে\n"
+        f"2️⃣ প্রতিটি দৃশ্যের জন্য Imagen AI ছবি তৈরি হবে\n"
+        f"3️⃣ বাংলা পুরুষ/মহিলা ভয়েস নারেশন তৈরি হবে\n"
+        f"4️⃣ ক্যারেক্টারের নাম ব্যাজ + ডায়ালগ সাবটাইটেল যোগ হবে\n"
+        f"5️⃣ 9:16 ভার্টিকাল শর্টস ভিডিও রেন্ডার হবে\n"
+        f"6️⃣ YouTube Shorts-এ আপলোড হবে\n\n"
+        f"_অনুগ্রহ করে অপেক্ষা করো... (৫-১০ মিনিট লাগতে পারে)_",
+        parse_mode='Markdown'
+    )
+
+    thread = threading.Thread(
+        target=_drama_video_pipeline,
+        args=(chat_id, topic),
+        daemon=True
+    )
+    thread.start()
+
+
+def _drama_video_pipeline(chat_id: int, topic: str):
+    """Full drama video creation + upload pipeline."""
+    session = get_session(chat_id)
+    voice = session.get('voice', DEFAULT_VOICE)
+    tmp_files = []
+
+    def _notify(msg):
+        try:
+            bot.send_message(chat_id, msg, parse_mode='Markdown')
+        except Exception:
+            pass
+
+    def _progress_cb(msg):
+        try:
+            bot.send_message(chat_id, f"  ↳ {msg}")
+        except Exception:
+            pass
+
+    try:
+        # Step 1: Generate Bangla emotional drama script
+        _notify("🧠 *Step 1/5:* Gemini AI দিয়ে বাংলা ইমোশনাল ড্রামা স্ক্রিপ্ট তৈরি হচ্ছে...")
+        drama_data = generate_drama_script(topic)
+
+        scenes = drama_data.get("scenes", [])
+        video_title = drama_data.get("title", f"💔 {topic} - ইমোশনাল নাটক")[:100]
+        video_desc  = drama_data.get("description", "")[:5000]
+        video_tags  = drama_data.get("tags", ["natok", "emotional", "bangla"])[:15]
+
+        if not scenes:
+            _notify("❌ স্ক্রিপ্ট তৈরিতে সমস্যা হয়েছে। আবার চেষ্টা করো।")
+            return
+
+        _notify(
+            f"✅ স্ক্রিপ্ট তৈরি!\n"
+            f"📌 Title: *{video_title}*\n"
+            f"🎬 মোট দৃশ্য: *{len(scenes)}টি*"
+        )
+
+        # Step 2-4: Create drama short video
+        _notify(
+            "🎬 *Step 2-4/5:* AI ছবি + বাংলা ভয়েস + ড্রামা ফ্রেম তৈরি হচ্ছে...\n"
+            "_(প্রতিটি দৃশ্যে কিছু সময় লাগবে)_"
+        )
+        video_path = create_drama_short_video(
+            scenes=scenes,
+            voice_key=voice,
+            output_dir=".",
+            progress_callback=_progress_cb
+        )
+        tmp_files.append(video_path)
+
+        # Step 5: Thumbnail
+        _notify("🖼️ *Step 5/5:* Thumbnail তৈরি হচ্ছে...")
+        thumb_path = f"thumb_drama_{int(time.time())}.jpg"
+        create_thumbnail(title=video_title, topic=topic[:20], output_path=thumb_path)
+        tmp_files.append(thumb_path)
+
+        # Step 6: Upload to YouTube Shorts
+        _notify("🚀 *YouTube Shorts Upload শুরু হয়েছে...*")
+        video_id = upload_video(
+            file_path=video_path,
+            title=video_title,
+            description=video_desc,
+            tags=video_tags,
+            privacy_status="public"
+        )
+
+        if video_id and os.path.exists(thumb_path):
+            try:
+                upload_thumbnail(video_id, thumb_path)
+            except Exception as e:
+                print(f"Drama thumbnail upload failed: {e}")
+
+        success_text = f"""
+🎉 *ইমোশনাল নাটক শর্টস সফলভাবে YouTube-এ আপলোড হয়েছে!*
+
+🔗 লিংক: https://youtu.be/{video_id}
+📌 Title: *{video_title}*
+🎭 Style: *Bangla Emotional Drama Shorts*
+⚙️ Status: *PUBLIC*
+
+💡 *টিপস:* প্রতিদিন ভিন্ন ইমোশনাল টপিকে নাটক বানাও!
+        """
+        bot.send_message(chat_id, success_text, parse_mode='Markdown')
+
+        try:
+            with open(thumb_path, 'rb') as th:
+                bot.send_photo(chat_id, th, caption=f"🖼️ Thumbnail: {video_title}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        bot.send_message(
+            chat_id,
+            f"❌ ড্রামা ভিডিও তৈরিতে সমস্যা:\n`{e}`\n\nআবার চেষ্টা করো।",
+            parse_mode='Markdown'
+        )
+    finally:
+        for f in tmp_files:
+            try:
+                if f and os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
 
 
 def _start_video_creation(chat_id: int, topic: str, is_short: bool = False):
@@ -322,6 +495,8 @@ def _full_video_pipeline(chat_id: int, topic: str, is_short: bool, custom_script
             pass
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         bot.send_message(chat_id, f"❌ ভিডিও তৈরিতে সমস্যা হয়েছে:\n`{e}`\n\nআবার চেষ্টা করো।", parse_mode='Markdown')
 
     finally:
@@ -527,6 +702,62 @@ def handle_voices(message):
     bot.send_message(
         chat_id,
         f"🎤 *Narration Voice বেছে নাও:*\n\n_(বর্তমান: {VOICE_LABELS.get(current, current)})_",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║          BGM SELECTION                                   ║
+# ╚══════════════════════════════════════════════════════════╝
+
+@bot.message_handler(commands=['bgm'])
+def handle_bgm(message):
+    chat_id = message.chat.id
+    session = get_session(chat_id)
+    current = session.get('bgm_preference')
+    
+    bgm_dir = "assets/audio"
+    bgm_files = []
+    if os.path.exists(bgm_dir):
+        bgm_files = [
+            f for f in os.listdir(bgm_dir)
+            if f.endswith(".mp3") and f != "bgm_combined.mp3" and not f.startswith("outro_")
+        ]
+    bgm_files.sort()
+    
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    # Random option
+    rnd_text = "✅ Random / মিশ্র BGM (Default)" if current is None else "Random / মিশ্র BGM (Default)"
+    markup.add(InlineKeyboardButton(rnd_text, callback_data="bgm_set_random"))
+    
+    for f in bgm_files:
+        btn_label = f
+        if f == "bgm_chiro_abhagi.mp3":
+            btn_label = "🎶 Chiro Abhagi (চির অভাগী - Viral Song)"
+        elif f == "bgm1.mp3":
+            btn_label = "🎵 BGM 1 (Sad Dramatic)"
+        elif f == "bgm2.mp3":
+            btn_label = "🎵 BGM 2 (Melancholic)"
+        elif f == "bgm3.mp3":
+            btn_label = "🎵 BGM 3 (Emotional Piano)"
+        elif f == "bgm4.mp3":
+            btn_label = "🎵 BGM 4 (Sad Flute)"
+            
+        btn_text = f"✅ {btn_label}" if f == current else btn_label
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"bgm_set_{f}"))
+        
+    current_label = "Random"
+    if current:
+        if current == "bgm_chiro_abhagi.mp3":
+            current_label = "Chiro Abhagi (চির অভাগী)"
+        else:
+            current_label = current
+            
+    bot.send_message(
+        chat_id,
+        f"🎵 *Background Music (BGM) বেছে নাও:*\n\n_(বর্তমান: {current_label})_",
         reply_markup=markup,
         parse_mode='Markdown'
     )
@@ -878,6 +1109,43 @@ def callback_query(call):
     chat_id = call.message.chat.id
     session = get_session(chat_id)
 
+    # ── Settings Shortcuts ───────────────────────────────────────────────────
+    if call.data == "btn_auth":
+        bot.answer_callback_query(call.id)
+        handle_auth(call.message)
+        return
+    elif call.data == "btn_status":
+        bot.answer_callback_query(call.id)
+        handle_my_status(call.message)
+        return
+    elif call.data == "btn_voices":
+        bot.answer_callback_query(call.id)
+        handle_voices(call.message)
+        return
+    elif call.data == "btn_schedule":
+        bot.answer_callback_query(call.id)
+        handle_autoschedule(call.message)
+        return
+    elif call.data.startswith("yt_"):
+        parts = call.data.replace("yt_", "").split("_", 1)
+        fmt = parts[0]
+        url = parts[1]
+        is_short = fmt == "short"
+        
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text(
+            "⏳ *ইউটিউব ভিডিওর তথ্য সংগ্রহ করা হচ্ছে...*\n"
+            "স্মার্ট এডিটিং অ্যালগরিদম দিয়ে সেরা অংশ খোঁজা হচ্ছে...",
+            chat_id, call.message.message_id, parse_mode='Markdown'
+        )
+        
+        threading.Thread(
+            target=_start_youtube_flow,
+            args=(chat_id, url, is_short),
+            daemon=True
+        ).start()
+        return
+
     # ── Voice selection ──────────────────────────────────────────────────────
     if call.data.startswith("voice_"):
         voice_key = call.data.replace("voice_", "")
@@ -887,6 +1155,36 @@ def callback_query(call):
             bot.answer_callback_query(call.id, f"✅ Voice পরিবর্তিত: {VOICE_LABELS.get(voice_key, voice_key)}")
             bot.edit_message_text(
                 f"✅ Narration Voice সেট হয়েছে:\n*{VOICE_LABELS.get(voice_key, voice_key)}*",
+                chat_id, call.message.message_id, parse_mode='Markdown'
+            )
+        return
+
+    # ── BGM selection ────────────────────────────────────────────────────────
+    if call.data.startswith("bgm_set_"):
+        bgm_key = call.data.replace("bgm_set_", "")
+        if bgm_key == "random":
+            session['bgm_preference'] = None
+            bot.answer_callback_query(call.id, "✅ BGM পরিবর্তিত: Random BGM (ডিফল্ট)")
+            bot.edit_message_text(
+                "✅ Background Music (BGM) সেট হয়েছে:\n*Random / মিশ্র BGM*",
+                chat_id, call.message.message_id, parse_mode='Markdown'
+            )
+        else:
+            session['bgm_preference'] = bgm_key
+            label = bgm_key
+            if bgm_key == "bgm_chiro_abhagi.mp3":
+                label = "Chiro Abhagi (চির অভাগী)"
+            elif bgm_key == "bgm1.mp3":
+                label = "BGM 1"
+            elif bgm_key == "bgm2.mp3":
+                label = "BGM 2"
+            elif bgm_key == "bgm3.mp3":
+                label = "BGM 3"
+            elif bgm_key == "bgm4.mp3":
+                label = "BGM 4"
+            bot.answer_callback_query(call.id, f"✅ BGM পরিবর্তিত: {label}")
+            bot.edit_message_text(
+                f"✅ Background Music (BGM) সেট হয়েছে:\n*{label}*",
                 chat_id, call.message.message_id, parse_mode='Markdown'
             )
         return
@@ -1075,41 +1373,469 @@ def _auto_create_and_upload(chat_id: int, niche: str, voice: str, is_short: bool
 @bot.message_handler(func=lambda message: message.text in [
     "🎬 Create Video",
     "📅 Auto-Post Schedule",
-    "📊 Grow Channel"
+    "📊 Grow Channel",
+    "🎥 Long Video",
+    "📱 Short Video",
+    "⚙️ Settings",
+    "📱 Shorts ভিডিও ক্লিপ",
+    "📺 লং ভিডিও ক্লিপ",
+    "🎭 ইমোশনাল নাটক শর্টস",
+    "⚙️ অডিও সেটিংস পরিবর্তন"
 ])
 def handle_button_clicks(message):
     chat_id = message.chat.id
     text = message.text
-    
-    if text == "🎬 Create Video":
+
+    if text == "🎭 ইমোশনাল নাটক শর্টস":
         sent = bot.send_message(
             chat_id,
-            "✍️ **ভিডিওর টপিক অথবা আপনার নিজের গল্পটি লিখুন:**\n\n"
-            "• আপনি চাইলে শুধু টপিক লিখতে পারেন (যেমন: `মহাকাশের রহস্য`)\n"
-            "• অথবা আপনার পুরো গল্পটি এখানে লিখতে পারেন।",
+            "🎭 *ইমোশনাল নাটক শর্টস তৈরি করুন*\n\n"
+            "কোন টপিকে বাংলা ইমোশনাল নাটক বানাতে চান? লিখুন:\n\n"
+            "_উদাহরণ: ভাঙা ভালোবাসা / মায়ের কষ্ট / বন্ধুত্বের বিশ্বাসঘাতকতা_",
             parse_mode='Markdown'
         )
-        def _handle_unified_creation(m):
+        def _handle_drama_btn(m):
+            t = m.text.strip()
+            if t.startswith('/'):
+                bot.send_message(m.chat.id, "❌ বাতিল।")
+                return
+            _start_drama_creation(m.chat.id, t)
+        bot.register_next_step_handler(sent, _handle_drama_btn)
+        return
+
+    if text == "📱 Shorts ভিডিও ক্লিপ" or text == "📱 Short Video":
+        sent = bot.send_message(
+            chat_id,
+            "✍️ **ইউটিউব ভিডিও লিংকটি দিন:**\n\n📱 Shorts ভিডিও ক্লিপ তৈরি করতে ইউটিউব ভিডিওর লিংকটি এখানে পেস্ট করুন।",
+            parse_mode='Markdown'
+        )
+        def _handle_short_creation(m):
             user_input = m.text.strip()
             if user_input.startswith('/'):
                 bot.send_message(m.chat.id, "❌ বাতিল করা হয়েছে।")
                 return
-                
-            # If the user input is long or contains sentence ends, treat as Story Mode
-            if len(user_input) > 45 or any(c in user_input for c in ["।", "\n", "\r", "?", "!"]):
-                bot.send_message(m.chat.id, "✅ গল্প পেয়েছি! এআই দিয়ে ভিডিও তৈরি শুরু হচ্ছে...\n\n⏳ অনুগ্রহ করে অপেক্ষা করুন (৩-৫ মিনিট)")
-                _full_video_pipeline(m.chat.id, user_input[:40], is_short=False, custom_script=user_input)
+            if "youtube.com" in user_input or "youtu.be" in user_input:
+                _start_youtube_flow(m.chat.id, user_input, is_short=True)
             else:
-                _start_video_creation(m.chat.id, user_input, is_short=False)
-                
-        bot.register_next_step_handler(sent, _handle_unified_creation)
+                bot.send_message(m.chat.id, "❌ অনুগ্রহ করে একটি সঠিক ইউটিউব ভিডিও লিংক পাঠান।")
+        bot.register_next_step_handler(sent, _handle_short_creation)
+
+    elif text == "📺 লং ভিডিও ক্লিপ" or text == "🎥 Long Video" or text == "🎬 Create Video":
+        sent = bot.send_message(
+            chat_id,
+            "✍️ **ইউটিউব ভিডিও লিংকটি দিন:**\n\n📺 লং ভিডিও ক্লিপ তৈরি করতে ইউটিউব ভিডিওর লিংকটি এখানে পেস্ট করুন।",
+            parse_mode='Markdown'
+        )
+        def _handle_long_creation(m):
+            user_input = m.text.strip()
+            if user_input.startswith('/'):
+                bot.send_message(m.chat.id, "❌ বাতিল করা হয়েছে।")
+                return
+            if "youtube.com" in user_input or "youtu.be" in user_input:
+                _start_youtube_flow(m.chat.id, user_input, is_short=False)
+            else:
+                bot.send_message(m.chat.id, "❌ অনুগ্রহ করে একটি সঠিক ইউটিউব ভিডিও লিংক পাঠান।")
+        bot.register_next_step_handler(sent, _handle_long_creation)
         
-    elif text == "📅 Auto-Post Schedule":
-        handle_autoschedule(message)
+    elif text == "⚙️ অডিও সেটিংস পরিবর্তন" or text == "⚙️ Settings" or text == "📅 Auto-Post Schedule":
+        settings_text = """
+⚙️ *বট সেটিংস এবং নিয়ন্ত্রণ প্যানেল:*
+
+• `/auth` - ইউটিউব চ্যানেল কানেক্ট করুন
+• `/mystatus` - বর্তমান শিডিউল স্ট্যাটাস দেখুন
+• `/voices` - ভয়েস (Voice narration) পরিবর্তন করুন
+• `/autoschedule` - প্রতিদিনের অটো-পোস্ট সেট করুন
+• `/stopschedule` - অটো-পোস্ট শিডিউল বন্ধ করুন
+• `/stats` - ইউটিউব চ্যানেলের বর্তমান স্ট্যাটস দেখুন
+        """
+        from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🔐 Connect Channel", callback_data="btn_auth"),
+            InlineKeyboardButton("📊 Check Status", callback_data="btn_status"),
+            InlineKeyboardButton("🎤 Change Voice", callback_data="btn_voices"),
+            InlineKeyboardButton("📅 Setup Schedule", callback_data="btn_schedule"),
+            InlineKeyboardButton("📈 Channel Stats", callback_data="btn_stats")
+        )
+        bot.send_message(chat_id, settings_text, reply_markup=markup, parse_mode='Markdown')
         
     elif text == "📊 Grow Channel":
         handle_stats(message)
 
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║          YOUTUBE PROCESSOR FLOW                          ║
+# ╚══════════════════════════════════════════════════════════╝
+
+def is_youtube_url(text):
+    if not text:
+        return False
+    return "youtube.com" in text or "youtu.be" in text
+
+@bot.message_handler(func=lambda message: message.text and is_youtube_url(message.text))
+def handle_youtube_link(message):
+    chat_id = message.chat.id
+    url = message.text.strip()
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("📱 Shorts ক্লিপ (৩০-৯০ সে.)", callback_data=f"yt_short_{url}"),
+        InlineKeyboardButton("📺 লং ক্লিপ (১০-১৫ মি.)", callback_data=f"yt_long_{url}")
+    )
+    bot.send_message(
+        chat_id,
+        "📥 *ইউটিউব লিংক পাওয়া গেছে!*\n\nভিডিওটি থেকে কোন ধরনের ক্লিপ তৈরি করতে চান তা নির্বাচন করুন:",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+def _start_youtube_flow(chat_id: int, url: str, is_short: bool):
+    from youtube_processor import get_video_duration
+    try:
+        duration, title = get_video_duration(url)
+    except Exception:
+        duration, title = 0, "My YouTube Clip"
+        
+    if duration == 0:
+        bot.send_message(chat_id, "❌ ভিডিওর তথ্য পাওয়া যায়নি। অনুগ্রহ করে সঠিক লিংক দিন।")
+        return
+        
+    session = get_session(chat_id)
+    session['yt_url'] = url
+    session['yt_title'] = title
+    session['yt_is_short'] = is_short
+    session['yt_duration'] = duration
+    
+    from youtube_processor import format_seconds
+    dur_str = format_seconds(duration)
+    
+    text = f"🎥 *ভিডিও তথ্য:*\n📌 Title: `{title}`\n⏱️ Duration: `{dur_str}`\n\n"
+    if is_short:
+        text += "📱 *Shorts ক্লিপ তৈরি হচ্ছে...*\n"
+    else:
+        text += "📺 *লং ক্লিপ তৈরি হচ্ছে...*\n"
+        
+    text += "\n⏳ *প্রক্রিয়া শুরু হচ্ছে...*\n🤖 Gemini AI ভিডিওর ট্রান্সক্রিপ্ট বিশ্লেষণ করে সবচেয়ে আকর্ষণীয় অংশটি খুঁজে বের করে এডিট করছে...\n\nএটি সম্পন্ন হতে ২-৫ মিনিট সময় নিতে পারে। অনুগ্রহ করে অপেক্ষা করুন।"
+    
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+    
+    threading.Thread(
+        target=_run_youtube_pipeline_auto,
+        args=(chat_id, url, is_short, title, duration),
+        daemon=True
+    ).start()
+
+def generate_clickbait_metadata(original_title, original_desc=""):
+    from gemini_helper import client, DEFAULT_MODEL
+    if not client:
+        return {
+            "title": f"{original_title} (AI Remastered)",
+            "description": "Processed with AI Automator Bot.",
+            "tags": ["remastered", "clip"]
+        }
+    prompt = f"""
+    You are a viral YouTube automation research bot and growth expert.
+    Based on the following original video details, generate:
+    1. A single highly viral, clickbait, and engaging YouTube title (under 70 characters).
+    2. A short engaging description (under 150 words).
+    3. 5-7 viral tags.
+    
+    Return the response in JSON format matching this Pydantic schema:
+    {{
+      "title": "Title",
+      "description": "Description here",
+      "tags": ["tag1", "tag2"]
+    }}
+    
+    Original Title: {original_title}
+    Original Description: {original_desc}
+    """
+    import time
+    for attempt in range(3):
+        try:
+            import json
+            response = client.models.generate_content(
+                model=DEFAULT_MODEL,
+                contents=prompt
+            )
+            text = response.text.strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            res_dict = json.loads(text)
+            return {
+                "title": res_dict.get("title", f"{original_title} (AI Remastered)").strip(),
+                "description": res_dict.get("description", "Processed with AI Automator Bot.").strip(),
+                "tags": res_dict.get("tags", ["remastered"])
+            }
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed to generate clickbait SEO: {e}")
+            if attempt == 2:
+                return {
+                    "title": f"{original_title} (AI Remastered)",
+                    "description": "Processed with AI Automator Bot.",
+                    "tags": ["remastered"]
+                }
+            time.sleep(2)
+
+def _run_youtube_pipeline_auto(chat_id: int, url: str, is_short: bool, original_title: str, duration: int):
+    import os
+    import random
+    import subprocess
+    
+    temp_files = []
+    
+    temp_raw = os.path.join(".", f"raw_download_{chat_id}.mp4")
+    temp_processed = os.path.join(".", f"processed_{chat_id}.mp4")
+    thumb_path = os.path.join(".", f"thumb_{chat_id}.jpg")
+    
+    temp_files.extend([temp_raw, temp_processed, thumb_path])
+    
+    try:
+        from youtube_processor import (
+            extract_video_id, get_video_transcript, find_best_segments_with_gemini, 
+            parse_time, download_youtube_clip, process_clip_copyright_bypass, 
+            mix_bgm_on_merged_video, format_seconds, compress_video_if_needed
+        )
+        
+        # Resolve custom avatar logo and outro voiceover for this user if they exist
+        avatar_file = os.path.join("assets", f"avatar_{chat_id}.png")
+        outro_file = os.path.join("assets", "audio", f"outro_{chat_id}.mp3")
+        
+        avatar_path = avatar_file if os.path.exists(avatar_file) else None
+        outro_path = outro_file if os.path.exists(outro_file) else None
+        
+        video_id = extract_video_id(url)
+        bot.send_message(chat_id, "🤖 Gemini AI দিয়ে ভিডিওর ট্রান্সক্রিপ্ট বিশ্লেষণ করা হচ্ছে (সেরা দৃশ্যগুলো খুঁজে বের করার জন্য)...")
+        transcript = get_video_transcript(video_id) if video_id else ""
+        
+        gemini_res = None
+        if transcript:
+            try:
+                gemini_res = find_best_segments_with_gemini(transcript, duration, is_short)
+            except Exception as e:
+                print(f"Gemini segment finding failed: {e}")
+            
+        segments = gemini_res.get("segments", []) if gemini_res else []
+        teaser_start_time = gemini_res.get("teaser_start_time", "") if gemini_res else ""
+        teaser_duration = gemini_res.get("teaser_duration", 0) if gemini_res else 0
+        
+        processed_segment_paths = []
+        
+        if segments:
+            # Disabled teaser prepending to prevent duplicate repetition of the same clip
+            if False and teaser_duration > 0 and teaser_start_time:
+                start_sec = parse_time(teaser_start_time)
+                if start_sec >= duration:
+                    start_sec = 0
+                start_fmt = format_seconds(start_sec)
+                end_fmt = format_seconds(start_sec + teaser_duration)
+                
+                bot.send_message(chat_id, f"🔥 [ভাইরাল টিজার হুক] ডাউনলোড হচ্ছে (`{start_fmt} - {end_fmt}`)...")
+                
+                teaser_raw = os.path.join(".", f"raw_teaser_{chat_id}.mp4")
+                teaser_processed = os.path.join(".", f"proc_teaser_{chat_id}.mp4")
+                temp_files.extend([teaser_raw, teaser_processed])
+                
+                download_youtube_clip(url, teaser_start_time, teaser_duration, teaser_raw)
+                process_clip_copyright_bypass(
+                    teaser_raw, teaser_processed, 
+                    is_short=is_short, mix_bgm=False,
+                    avatar_path=avatar_path, outro_path=outro_path
+                )
+                processed_segment_paths.append(teaser_processed)
+                
+            bot.send_message(chat_id, f"🎬 Gemini AI মোট {len(segments)} টি সেরা দৃশ্য নির্বাচন করেছে। দৃশ্যগুলো প্রসেস করা হচ্ছে...")
+            
+            for idx, seg in enumerate(segments):
+                start_time_str = seg.get("start_time", "0") if isinstance(seg, dict) else getattr(seg, "start_time", "0")
+                clip_dur = seg.get("duration", 0) if isinstance(seg, dict) else getattr(seg, "duration", 0)
+                narration_text = seg.get("narration", "") if isinstance(seg, dict) else getattr(seg, "narration", "")
+                start_sec = parse_time(start_time_str)
+                if start_sec >= duration:
+                    start_sec = 0
+                
+                start_fmt = format_seconds(start_sec)
+                end_fmt = format_seconds(start_sec + clip_dur)
+                
+                bot.send_message(chat_id, f"📥 [দৃশ্য {idx+1}/{len(segments)}] ডাউনলোড হচ্ছে (`{start_fmt} - {end_fmt}`)...")
+                
+                seg_raw = os.path.join(".", f"raw_seg_{chat_id}_{idx}.mp4")
+                seg_processed = os.path.join(".", f"proc_seg_{chat_id}_{idx}.mp4")
+                temp_files.extend([seg_raw, seg_processed])
+                
+                download_youtube_clip(url, start_time_str, clip_dur, seg_raw)
+                
+                # Generate AI narration voiceover audio if narration text is provided
+                narration_path = None
+                if narration_text:
+                    bot.send_message(chat_id, f"🎙️ [দৃশ্য {idx+1}] এআই কমেন্ট্রি ভয়েস তৈরি হচ্ছে: \"{narration_text}\"...")
+                    try:
+                        from video_creator import _generate_audio
+                        narr_audio = os.path.join(".", f"narr_audio_{chat_id}_{idx}.mp3")
+                        _generate_audio(narration_text, "bn_male", narr_audio)
+                        if os.path.exists(narr_audio):
+                            narration_path = narr_audio
+                            temp_files.append(narr_audio)
+                    except Exception as e:
+                        print(f"Failed to generate narration audio: {e}")
+                
+                process_clip_copyright_bypass(
+                    seg_raw, seg_processed, 
+                    is_short=is_short, mix_bgm=False,
+                    avatar_path=avatar_path, outro_path=outro_path,
+                    narration_path=narration_path
+                )
+                processed_segment_paths.append(seg_processed)
+                
+            bot.send_message(chat_id, "🔗 দৃশ্যগুলো একত্রিত (Stitch) করা হচ্ছে...")
+            concat_txt_path = os.path.join(".", f"concat_list_{chat_id}.txt")
+            temp_files.append(concat_txt_path)
+            
+            with open(concat_txt_path, "w") as f:
+                for path in processed_segment_paths:
+                    f.write(f"file '{os.path.abspath(path)}'\n")
+                    
+            temp_merged_raw = os.path.join(".", f"merged_raw_{chat_id}.mp4")
+            temp_files.append(temp_merged_raw)
+            
+            cmd_concat = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_txt_path,
+                "-c", "copy",
+                temp_merged_raw
+            ]
+            subprocess.run(cmd_concat, check=True)
+            
+            bot.send_message(chat_id, "⚙️ কপিরাইট বাইপাস ফিল্টার ও ব্যাকগ্রাউন্ড মিউজিক মিক্স করা হচ্ছে...")
+            pref_bgm = get_session(chat_id).get('bgm_preference')
+            mix_bgm_on_merged_video(temp_merged_raw, temp_processed, preferred_bgm=pref_bgm)
+            
+        else:
+            if is_short:
+                clip_dur = 60
+                if duration > clip_dur:
+                    start_sec = random.randint(0, int(duration - clip_dur))
+                else:
+                    start_sec = 0
+                start_time_str = str(start_sec)
+                
+                bot.send_message(chat_id, "🎲 ট্রান্সক্রিপ্ট পাওয়া যায়নি। শর্টস ক্লিপ ডাউনলোড ও প্রসেস করা হচ্ছে...")
+                download_youtube_clip(url, start_time_str, clip_dur, temp_raw)
+                process_clip_copyright_bypass(
+                    temp_raw, temp_processed, 
+                    is_short=is_short, mix_bgm=True,
+                    avatar_path=avatar_path, outro_path=outro_path
+                )
+            else:
+                bot.send_message(chat_id, "🎲 ট্রান্সক্রিপ্ট পাওয়া যায়নি। নাটকের বিভিন্ন অংশ থেকে ৪টি ক্লিপ কেটে সংকলন (Compilation) করা হচ্ছে...")
+                offsets = [0.15, 0.45, 0.70, 0.92]
+                seg_dur = 180
+                
+                for idx, offset in enumerate(offsets):
+                    start_sec = int(duration * offset)
+                    if start_sec + seg_dur > duration:
+                        start_sec = max(0, duration - seg_dur)
+                    
+                    start_time_str = str(start_sec)
+                    start_fmt = format_seconds(start_sec)
+                    end_fmt = format_seconds(start_sec + seg_dur)
+                    
+                    bot.send_message(chat_id, f"📥 [দৃশ্য {idx+1}/4] ডাউনলোড হচ্ছে (`{start_fmt} - {end_fmt}`)...")
+                    
+                    seg_raw = os.path.join(".", f"raw_seg_fb_{chat_id}_{idx}.mp4")
+                    seg_processed = os.path.join(".", f"proc_seg_fb_{chat_id}_{idx}.mp4")
+                    temp_files.extend([seg_raw, seg_processed])
+                    
+                    download_youtube_clip(url, start_time_str, seg_dur, seg_raw)
+                    process_clip_copyright_bypass(
+                        seg_raw, seg_processed, 
+                        is_short=is_short, mix_bgm=False,
+                        avatar_path=avatar_path, outro_path=outro_path
+                    )
+                    processed_segment_paths.append(seg_processed)
+                    
+                bot.send_message(chat_id, "🔗 দৃশ্যগুলো একত্রিত (Stitch) করা হচ্ছে...")
+                concat_txt_path = os.path.join(".", f"concat_list_{chat_id}.txt")
+                temp_files.append(concat_txt_path)
+                
+                with open(concat_txt_path, "w") as f:
+                    for path in processed_segment_paths:
+                        f.write(f"file '{os.path.abspath(path)}'\n")
+                        
+                temp_merged_raw = os.path.join(".", f"merged_raw_{chat_id}.mp4")
+                temp_files.append(temp_merged_raw)
+                
+                cmd_concat = [
+                    "ffmpeg", "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", concat_txt_path,
+                    "-c", "copy",
+                    temp_merged_raw
+                ]
+                subprocess.run(cmd_concat, check=True)
+                
+                bot.send_message(chat_id, "⚙️ কপিরাইট বাইপাস ফিল্টার ও ব্যাকগ্রাউন্ড মিউজিক মিক্স করা হচ্ছে...")
+                pref_bgm = get_session(chat_id).get('bgm_preference')
+                mix_bgm_on_merged_video(temp_merged_raw, temp_processed, preferred_bgm=pref_bgm)
+            
+        bot.send_message(chat_id, "✍️ Gemini AI দিয়ে ভাইরাল টাইটেল এবং SEO মেটা ডেসক্রিপশন তৈরি করা হচ্ছে...")
+        meta = generate_clickbait_metadata(original_title)
+        video_title = meta.get("title")
+        video_desc = meta.get("description")
+        video_tags = meta.get("tags", [])
+        
+        bot.send_message(chat_id, "⚙️ ভিডিও সাইজ অপ্টিমাইজ (কম্প্রেস) করা হচ্ছে...")
+        compress_video_if_needed(temp_processed)
+        
+        bot.send_message(chat_id, "🎨 কাস্টম থাম্বনেইল ইমেজ তৈরি করা হচ্ছে...")
+        from thumbnail_creator import create_thumbnail
+        create_thumbnail(title=video_title, topic="AI CLIP", output_path=thumb_path, video_path=temp_processed)
+        
+        # Output SEO Metadata Text
+        seo_text = f"""
+🤖 **AI Remastered Video Details:**
+
+📌 **Viral Title:** `{video_title}`
+
+📝 **SEO Description:**
+`{video_desc}`
+
+🏷️ **Tags:** `{', '.join(video_tags)}`
+        """
+        bot.send_message(chat_id, seo_text, parse_mode='Markdown')
+        
+        # Send Custom Thumbnail
+        if os.path.exists(thumb_path):
+            with open(thumb_path, 'rb') as t_file:
+                bot.send_photo(chat_id, t_file, caption="🎨 আপনার কাস্টম এআই থাম্বনেইল")
+                
+        # Send Final processed Video File directly to the user
+        bot.send_message(chat_id, "📥 ভিডিও ফাইলটি চ্যাটে আপলোড হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...")
+        with open(temp_processed, 'rb') as v_file:
+            bot.send_video(chat_id, v_file, caption=f"🎬 {video_title}", timeout=600)
+            
+        for path in temp_files:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        bot.send_message(chat_id, f"❌ ত্রুটি ঘটেছে: {e}")
+        for path in temp_files:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║          FALLBACK & MAIN                                 ║

@@ -23,7 +23,7 @@ except Exception as e:
     client = None
 
 # Model configuration
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash"
 
 def generate_script(topic: str) -> str:
     """
@@ -113,7 +113,98 @@ def generate_seo_meta(script_content: str) -> dict:
             "quota_limit": "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e)
         }
 
+def generate_drama_script(topic: str) -> dict:
+    """
+    Generates a viral Bangla emotional drama script in the style of popular YouTube Shorts
+    (like Farhan Mushfiq emotional drama clips).
+    Returns a dict with: scenes (list of scene dicts), title, description, tags
+    Each scene has: dialogue, emotion, visual_prompt, character (HERO/HEROINE/NARRATOR)
+    """
+    if not client:
+        return {
+            "scenes": [],
+            "title": "ইমোশনাল নাটক",
+            "description": "বাংলা ইমোশনাল শর্টস",
+            "tags": ["natok", "emotional", "bangla"]
+        }
+
+    prompt = f"""
+তুমি একজন বাংলা ভাইরাল YouTube Shorts নাটক স্ক্রিপ্টরাইটার।
+নিচের টপিকের উপর ভিত্তি করে একটি অত্যন্ত ইমোশনাল, হৃদয়গ্রাহী বাংলা শর্টস নাটক তৈরি করো:
+
+টপিক: "{topic}"
+
+নাটকটি হতে হবে:
+- ৩ থেকে ৪টি দৃশ্য (Scene) থাকবে (যেন ভিডিওর মোট দৈর্ঘ্য ৬০ সেকেন্ডের কম থাকে এবং এটি YouTube Shorts হিসেবে আপলোড হয়)
+- প্রতিটি দৃশ্যে HERO/HEROINE/NARRATOR এর ডায়ালগ থাকবে
+- অত্যন্ত ইমোশনাল এবং নাটকীয় ভাষায় লেখা
+- বাংলাদেশী নাটক স্টাইলে (যেমন: ফারহান-মুশফিক টাইপ)
+- সবকিছু বাংলায় লিখবে (রোমান বাংলা নয়, বাংলা হরফে)
+
+JSON ফরম্যাটে রিটার্ন করো:
+{{
+  "title": "ভাইরাল ইমোশনাল টাইটেল (৬০ অক্ষরের মধ্যে)",
+  "description": "YouTube SEO Description (বাংলায়, ১৫০ শব্দের মধ্যে)",
+  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7"],
+  "scenes": [
+    {{
+      "scene_num": 1,
+      "character": "NARRATOR",
+      "dialogue": "নাটকের শুরুতে পরিচয় দেওয়ার ডায়ালগ...",
+      "emotion": "sad",
+      "visual_prompt": "English description for AI image generation (cinematic, emotional Bengali scene)"
+    }},
+    {{
+      "scene_num": 2,
+      "character": "HERO",
+      "dialogue": "হিরোর ইমোশনাল ডায়ালগ...",
+      "emotion": "crying",
+      "visual_prompt": "English description for AI image generation"
+    }}
+  ]
+}}
+
+- দৃশ্যগুলো হবে: intro hook, conflict buildup, emotional peak, twist, resolution
+- সর্বশেষ দৃশ্যে অবশ্যই দর্শককে উৎসাহিত করে এই ডায়ালগটি যোগ করবে: "আমার ভিডিওটি ভালো লেগে থাকলে লাইক, কমেন্ট ও শেয়ার করবেন।"
+- visual_prompt অবশ্যই ইংরেজিতে হবে এবং তাতে দৃশ্যটি বিশদভাবে বর্ণনা করবে। যদি দুই চরিত্র কথা বলে বা একসাথে থাকে, তবে দুজনকে একসাথে একটি মিডিয়াম শটে (medium shot of both characters) দেখাবে। ডায়ালগের সময় ক্যারেক্টারদের মুখমণ্ডল এবং মাথা যেন ফ্রেমের বাইরে কেটে না যায়, তা নিশ্চিত করতে prompts-এ 'centered composition, medium shot showing both characters, safe frame margins, faces fully inside the frame' উল্লেখ করবে। মুখমণ্ডল ও ক্যারেক্টার যেন একদম পরিষ্কার, অত্যন্ত স্পষ্ট ও শার্প ফোকাসড (crystal clear faces, sharp focus, highly detailed features) থাকে। ব্যাকগ্রাউন্ডটি নরমভাবে ঝাপসা বা বোকেহ ইফেক্ট সহ (soft blurred background bokeh, f/1.8 shallow depth of field) এবং সিনেম্যাটিক কালার গ্রেডিং (teal and orange color palette) থাকবে।
+emotion হতে পারে: sad, crying, angry, shocked, loving, desperate, hopeful
+character হতে পারে: HERO, HEROINE, NARRATOR, VILLAIN
+"""
+    try:
+        response = client.models.generate_content(
+            model=DEFAULT_MODEL,
+            contents=prompt
+        )
+        text = response.text.strip()
+        # Strip markdown code block if present
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+        import json as _json
+        result = _json.loads(text)
+        return result
+    except Exception as e:
+        print(f"[Drama Script] Error: {e}")
+        # Fallback
+        return {
+            "title": f"💔 {topic} - ইমোশনাল শর্টস নাটক",
+            "description": f"বাংলা ইমোশনাল নাটক: {topic}",
+            "tags": ["natok", "emotional", "bangla", "shorts", "drama", "viral", "bangladesh"],
+            "scenes": [
+                {
+                    "scene_num": 1,
+                    "character": "NARRATOR",
+                    "dialogue": f"এটি একটি ইমোশনাল গল্প... {topic} নিয়ে।",
+                    "emotion": "sad",
+                    "visual_prompt": f"Emotional Bengali drama scene about {topic}, cinematic lighting, tears"
+                }
+            ]
+        }
+
+
 def analyze_and_suggest_growth(stats_data: dict) -> str:
+
     """
     Provides channel optimization advice based on basic stats data.
     """
