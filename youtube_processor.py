@@ -694,15 +694,53 @@ def clean_bangla_title(title):
     result = " ".join(cleaned_words).strip()
     return result if result else title
 
-def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=3.0):
+class OneEuroFilter:
+    """1€ filter (Casiez et al., CHI 2012 — open source algorithm).
+
+    Adaptive low-pass filter: kills jitter when the subject is still, yet
+    stays responsive during fast movement — the industry-standard technique
+    for smoothing noisy tracker signals without visible lag.
+    """
+
+    def __init__(self, freq, min_cutoff=0.4, beta=0.08, d_cutoff=1.0):
+        import math  # keeps module-level deps unchanged
+        self._math = math
+        self.freq = float(freq)
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = None
+        self.dx_prev = 0.0
+
+    def _alpha(self, cutoff):
+        te = 1.0 / self.freq
+        tau = 1.0 / (2 * self._math.pi * cutoff)
+        return 1.0 / (1.0 + tau / te)
+
+    def filter(self, x):
+        if self.x_prev is None:
+            self.x_prev = x
+            return x
+        dx = (x - self.x_prev) * self.freq
+        edx = self.dx_prev + self._alpha(self.d_cutoff) * (dx - self.dx_prev)
+        cutoff = self.min_cutoff + self.beta * abs(edx)
+        xf = self.x_prev + self._alpha(cutoff) * (x - self.x_prev)
+        self.x_prev, self.dx_prev = xf, edx
+        return xf
+
+
+def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0):
     """
     Subject-tracking (face + body) crop helper.
 
     Samples downscaled frames from the video (hflipped, so coordinates match
-    the crop-chain orientation), detects the dominant subject with OpenCV Haar
-    cascades (priority: frontal face → profile face → upper body → full body),
-    smooths the position track with a speed-limited, heavily averaged filter
-    (so the pan is gradual and visually undetectable) and writes an ffmpeg
+    the crop-chain orientation) and detects the dominant subject:
+      1. YuNet (opencv_zoo, Apache-2.0) DNN face detector — catches faces
+         Haar misses (small, angled, distant);
+      2. Haar cascade fallbacks (frontal → profile face → upper body →
+         full body) keep the person framed when no face is visible.
+    The track is smoothed with the 1€ filter plus a gentle speed ceiling so
+    the crop pan stays visually undetectable, and written as an ffmpeg
     sendcmd commands file that drives the crop filter's x/y so the crop
     window keeps the subject centred at all times.
 
@@ -754,9 +792,23 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=3.0
         ]
         proc = subprocess.Popen(sample_cmd, stdout=subprocess.PIPE)
         frame_bytes = sample_w * sample_h * 3
-        # Subject detection priority: frontal face → profile face → upper body
-        # → full body, so the person stays framed even when the face turns away
-        detectors = [
+        # Primary detector: YuNet (opencv_zoo, Apache-2.0) — a tiny open-source
+        # DNN model that reliably catches faces Haar misses (small, angled,
+        # distant). Fallbacks: Haar body cascades keep the person framed when
+        # no face is visible (profile shots, over-the-shoulder, back shots).
+        yunet = None
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "assets", "models", "face_detection_yunet_2023mar.onnx")
+        if os.path.exists(model_path):
+            try:
+                yunet = cv2.FaceDetectorYN_create(model_path, "", (sample_w, sample_h), score_threshold=0.55)
+            except Exception as e:
+                print(f"[subject-track] YuNet load failed ({e}); using Haar cascades only")
+                yunet = None
+        else:
+            print("[subject-track] YuNet model missing; using Haar cascades only")
+
+        haar_detectors = [
             (cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml"), (24, 24), 5, True),
             (cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml"), (24, 24), 4, True),
             (cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_upperbody.xml"), (36, 20), 5, False),
@@ -769,15 +821,23 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=3.0
             if len(buf) < frame_bytes:
                 break
             frame = np.frombuffer(buf, np.uint8).reshape(sample_h, sample_w, 3)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             box = None
             is_face = False
-            for det, min_sz, nbrs, face_cascade in detectors:
-                found = det.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=nbrs, minSize=min_sz)
-                if len(found) > 0:
-                    box = max(found, key=lambda f: f[2] * f[3])
-                    is_face = face_cascade
-                    break
+            if yunet is not None:
+                res = yunet.detect(frame)
+                faces = res[1] if isinstance(res, tuple) else res
+                if faces is not None and len(faces) > 0:
+                    f = max(faces, key=lambda r: r[2] * r[3])
+                    box = (f[0], f[1], f[2], f[3])
+                    is_face = True
+            if box is None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                for det, min_sz, nbrs, face_cascade in haar_detectors:
+                    found = det.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=nbrs, minSize=min_sz)
+                    if len(found) > 0:
+                        box = max(found, key=lambda f: f[2] * f[3])
+                        is_face = face_cascade
+                        break
             if box is not None:
                 bx, by, bw, bh = box
                 # For face hits, aim the frame centre at the upper body (chest)
@@ -817,26 +877,19 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=3.0
 
         txs, tys = zip(*[targets(x, y) for x, y in zip(xs, ys)])
 
-        def smooth(vals, max_step, window=9):
-            # Follow the target with a per-sample speed limit so the crop
-            # window pans gently instead of jumping, then a long moving
-            # average rounds off every corner — the drift stays visually
-            # undetectable
-            out = []
-            prev = vals[0]
-            for v in vals:
-                prev += max(-max_step, min(max_step, v - prev))
-                out.append(prev)
-            half = window // 2
-            sm = []
-            for i in range(len(out)):
-                a = max(0, i - half)
-                b = min(len(out), i + half + 1)
-                sm.append(sum(out[a:b]) / (b - a))
-            return sm
-
-        sm_x = smooth(list(txs), max(3.0, crop_w * 0.04))
-        sm_y = smooth(list(tys), max(3.0, crop_h * 0.04))
+        # 1€ filter smoothing (open source) — jitter-free when the subject is
+        # still, responsive when it moves; a gentle speed ceiling keeps the
+        # crop pan visually undetectable on top of that
+        max_step = max(3.0, crop_w * 0.04)
+        filt_x = OneEuroFilter(sample_fps, min_cutoff=0.4, beta=0.08)
+        filt_y = OneEuroFilter(sample_fps, min_cutoff=0.4, beta=0.08)
+        sm_x, sm_y = [], []
+        px, py = txs[0], tys[0]
+        for tx, ty in zip(txs, tys):
+            px += max(-max_step, min(max_step, filt_x.filter(tx) - px))
+            py += max(-max_step, min(max_step, filt_y.filter(ty) - py))
+            sm_x.append(px)
+            sm_y.append(py)
 
         # sendcmd works on the OUTPUT timeline (crop sits after setpts=PTS/speed)
         # START-only commands: each sets the crop offset once and it persists
