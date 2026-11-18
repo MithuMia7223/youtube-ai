@@ -694,24 +694,26 @@ def clean_bangla_title(title):
     result = " ".join(cleaned_words).strip()
     return result if result else title
 
-def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=2.0):
+def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=3.0):
     """
-    Face-tracking crop helper.
+    Subject-tracking (face + body) crop helper.
 
     Samples downscaled frames from the video (hflipped, so coordinates match
-    the crop-chain orientation), detects the dominant face with OpenCV Haar
-    cascades, smooths the position track and writes an ffmpeg sendcmd
-    commands file that drives the crop filter's x/y so the crop window
-    follows the face.
+    the crop-chain orientation), detects the dominant subject with OpenCV Haar
+    cascades (priority: frontal face → profile face → upper body → full body),
+    smooths the position track with a speed-limited, heavily averaged filter
+    (so the pan is gradual and visually undetectable) and writes an ffmpeg
+    sendcmd commands file that drives the crop filter's x/y so the crop
+    window keeps the subject centred at all times.
 
     Returns the commands file path, or None when tracking is not possible
-    (OpenCV missing, no stable face found, or any error) — the caller then
+    (OpenCV missing, no stable subject found, or any error) — the caller then
     keeps the static center crop.
     """
     try:
         import cv2
     except Exception as e:
-        print(f"[face-track] OpenCV unavailable ({e}); keeping static center crop")
+        print(f"[subject-track] OpenCV unavailable ({e}); keeping static center crop")
         return None
 
     tmp_path = None
@@ -729,14 +731,14 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=2.0
 
         # Mirror of the crop window sizes used by the ffmpeg crop filters below
         if is_short:
-            crop_w = min(src_w, src_h * 9 / 16)
-            crop_h = min(src_h, src_w * 16 / 9)
+            crop_w = min(src_w, src_h)   # 1:1 square window around the subject
+            crop_h = min(src_w, src_h)
         else:
             crop_w = src_w / 1.09
             crop_h = src_h / 1.09
 
         track_x = crop_w < src_w - 4      # room to slide horizontally
-        track_y = (not is_short) and crop_h < src_h - 4
+        track_y = crop_h < src_h - 4      # room to slide vertically
         if not track_x and not track_y:
             return None  # window already covers the frame; nothing to follow
 
@@ -752,22 +754,36 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=2.0
         ]
         proc = subprocess.Popen(sample_cmd, stdout=subprocess.PIPE)
         frame_bytes = sample_w * sample_h * 3
-        frontal = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+        # Subject detection priority: frontal face → profile face → upper body
+        # → full body, so the person stays framed even when the face turns away
+        detectors = [
+            (cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml"), (24, 24), 5, True),
+            (cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml"), (24, 24), 4, True),
+            (cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_upperbody.xml"), (36, 20), 5, False),
+            (cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_fullbody.xml"), (36, 60), 5, False),
+        ]
 
-        centers = []  # (cx, cy) in 0..1; None while no face seen yet
+        centers = []  # (cx, cy) in 0..1; None while no subject seen yet
         while True:
             buf = proc.stdout.read(frame_bytes)
             if len(buf) < frame_bytes:
                 break
             frame = np.frombuffer(buf, np.uint8).reshape(sample_h, sample_w, 3)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = frontal.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5, minSize=(24, 24))
-            if len(faces) == 0:
-                faces = profile.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(24, 24))
-            if len(faces) > 0:
-                fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-                centers.append(((fx + fw / 2) / sample_w, (fy + fh / 2) / sample_h))
+            box = None
+            is_face = False
+            for det, min_sz, nbrs, face_cascade in detectors:
+                found = det.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=nbrs, minSize=min_sz)
+                if len(found) > 0:
+                    box = max(found, key=lambda f: f[2] * f[3])
+                    is_face = face_cascade
+                    break
+            if box is not None:
+                bx, by, bw, bh = box
+                # For face hits, aim the frame centre at the upper body (chest)
+                # so the body stays framed, not just the head
+                cy = (by + bh / 2) / sample_h + (0.8 * bh / sample_h if is_face else 0.0)
+                centers.append(((bx + bw / 2) / sample_w, min(cy, 1.0)))
             else:
                 centers.append(None)
         proc.stdout.close()
@@ -776,7 +792,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=2.0
         n = len(centers)
         found = sum(1 for c in centers if c is not None)
         if n == 0 or found < max(2, int(n * 0.25)):
-            print(f"[face-track] No stable face ({found}/{n} samples); keeping static center crop")
+            print(f"[subject-track] No stable subject ({found}/{n} samples); keeping static center crop")
             return None
 
         # Fill gaps: carry the last seen position forward (leading gaps backfill
@@ -801,24 +817,26 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=2.0
 
         txs, tys = zip(*[targets(x, y) for x, y in zip(xs, ys)])
 
-        def smooth(vals, max_step):
+        def smooth(vals, max_step, window=9):
             # Follow the target with a per-sample speed limit so the crop
-            # window pans gently instead of jumping
+            # window pans gently instead of jumping, then a long moving
+            # average rounds off every corner — the drift stays visually
+            # undetectable
             out = []
             prev = vals[0]
             for v in vals:
                 prev += max(-max_step, min(max_step, v - prev))
                 out.append(prev)
-            # 3-sample moving average to round off the corners
+            half = window // 2
             sm = []
             for i in range(len(out)):
-                a = max(0, i - 1)
-                b = min(len(out), i + 2)
+                a = max(0, i - half)
+                b = min(len(out), i + half + 1)
                 sm.append(sum(out[a:b]) / (b - a))
             return sm
 
-        sm_x = smooth(list(txs), max(6.0, crop_w * 0.12))
-        sm_y = smooth(list(tys), max(6.0, crop_h * 0.12))
+        sm_x = smooth(list(txs), max(3.0, crop_w * 0.04))
+        sm_y = smooth(list(tys), max(3.0, crop_h * 0.04))
 
         # sendcmd works on the OUTPUT timeline (crop sits after setpts=PTS/speed)
         # START-only commands: each sets the crop offset once and it persists
@@ -839,10 +857,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=2.0
         fd, tmp_path = tempfile.mkstemp(prefix="face_cmds_", suffix=".txt")
         with os.fdopen(fd, "w") as f:
             f.write("\n".join(lines) + "\n")
-        print(f"[face-track] Face on {found}/{n} samples → crop follows the face ({tmp_path})")
+        print(f"[subject-track] Subject on {found}/{n} samples → crop follows smoothly ({tmp_path})")
         return tmp_path
     except Exception as e:
-        print(f"[face-track] Tracking failed ({e}); keeping static center crop")
+        print(f"[subject-track] Tracking failed ({e}); keeping static center crop")
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -1065,7 +1083,10 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"[{main_idx}:v]hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
-                f"{face_cmd_prefix}crop='min(iw,ih*9/16):min(ih,iw*16/9):(iw-ow)/2:(ih-oh)/2',scale=1080:1920:flags=lanczos"
+                f"split[v_sb][v_sf];"
+                f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
+                f"[v_sf]{face_cmd_prefix}crop='min(iw,ih):min(ih,iw):(iw-ow)/2:(ih-oh)/2',scale=1080:1080:flags=lanczos[v_sqs];"
+                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2"
                 f"{title_overlay}[v_main_raw]"
             )
             parts.append(v_main)
@@ -1184,7 +1205,10 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"[{main_idx}:v]hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
-                f"{face_cmd_prefix}crop='min(iw,ih*9/16):min(ih,iw*16/9):(iw-ow)/2:(ih-oh)/2',scale=1080:1920:flags=lanczos"
+                f"split[v_sb][v_sf];"
+                f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
+                f"[v_sf]{face_cmd_prefix}crop='min(iw,ih):min(ih,iw):(iw-ow)/2:(ih-oh)/2',scale=1080:1080:flags=lanczos[v_sqs];"
+                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2"
                 f"{title_overlay}"
             )
         else:
@@ -1323,7 +1347,10 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         if is_short:
             v_f = (
                 f"[0:v]hflip,setpts=PTS/{speed_factor:.4f},"
-                f"{face_cmd_prefix}crop='min(iw,ih*9/16):min(ih,iw*16/9):(iw-ow)/2:(ih-oh)/2',scale=1080:1920:flags=lanczos[v]"
+                f"split[v_sb][v_sf];"
+                f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
+                f"[v_sf]{face_cmd_prefix}crop='min(iw,ih):min(ih,iw):(iw-ow)/2:(ih-oh)/2',scale=1080:1080:flags=lanczos[v_sqs];"
+                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2[v]"
             )
         else:
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
