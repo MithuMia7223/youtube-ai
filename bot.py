@@ -57,14 +57,10 @@ def get_session(chat_id: int) -> dict:
 def send_welcome(message):
     chat_id = message.chat.id
     
-    # Create persistent menu buttons on user keyboard (Only Shorts & Long Video)
-    from telebot.types import ReplyKeyboardMarkup, KeyboardButton
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    
-    btn_short = KeyboardButton("📱 Shorts ভিডিও ক্লিপ")
-    btn_long  = KeyboardButton("📺 লং ভিডিও ক্লিপ")
-
-    markup.add(btn_short, btn_long)
+    # স্থায়ী কীবোর্ড-বার (Shorts/লং বাটন) সম্পূর্ণ সরানো হয়েছে — ব্যবহারকারীর
+    # অনুরোধে। পুরোনো ক্লায়েন্টে জমে থাকা বার-ও একবারে মুছে দিতে
+    # ReplyKeyboardRemove পাঠানো হচ্ছে।
+    from telebot.types import ReplyKeyboardRemove
 
     text = """
 👋 *হ্যালো! আমি আপনার YouTube AI Clipper Bot!*
@@ -72,13 +68,15 @@ def send_welcome(message):
 🤖 আমি আপনাকে সাহায্য করব যেকোনো ইউটিউব ভিডিওর লিংক থেকে কপিরাইট ফ্রি শর্টস বা লং ভিডিও ক্লিপ তৈরি করতে এবং তা সরাসরি আপনার চ্যানেলে আপলোড করতে।
 
 ━━━━━━━━━━━━━━━━━━━━
-👇 *কাজ শুরু করতে নিচের বাটনগুলো ব্যবহার করুন:*
+👇 *কমান্ড (নিচে বাটন নেই — লিখে পাঠাও):*
 ━━━━━━━━━━━━━━━━━━━━
-📱 *Shorts ভিডিও ক্লিপ* → YouTube ভিডিও থেকে শর্টস ক্লিপ তৈরি করো
-📺 *লং ভিডিও ক্লিপ* → YouTube ভিডিও থেকে লং ক্লিপ তৈরি করো
+`/create <বিষয়>` → নতুন ভিডিও তৈরি করো
+`/auth` → ইউটিউব চ্যানেল কানেক্ট
+`/status` · `/stats` · `/voices` · `/schedule`
 ⚙️ *ইউটিউব কানেক্ট না থাকলে প্রথমে /auth লিখে কানেক্ট করুন।*
     """
-    bot.send_message(chat_id, text, reply_markup=markup, parse_mode='Markdown')
+    bot.send_message(chat_id, text, reply_markup=ReplyKeyboardRemove(),
+                     parse_mode='Markdown')
 
 
 
