@@ -2,6 +2,7 @@ import os
 import subprocess
 import tempfile
 import random
+import math
 import re
 import imageio_ffmpeg
 import numpy as np
@@ -729,7 +730,40 @@ class OneEuroFilter:
         return xf
 
 
-def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0):
+# ─── Subject-tracking geometry (single source of truth) ──────────────────
+# Long-form : crop 1/TRACK_ZOOM_LONG of each axis, then scale back up.
+# Shorts    : pre-zoom the frame by TRACK_ZOOM_SHORT *before* the square crop.
+#             A 1:1 crop of a 16:9 source has ZERO vertical room, so the camera
+#             physically cannot follow a subject up/down. Pre-zooming buys that
+#             room back without changing the final output size.
+TRACK_ZOOM_LONG = 1.09
+TRACK_ZOOM_SHORT = 1.12
+
+
+def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None):
+    """
+    ffmpeg filter chain that crops a subject-following window.
+
+    The sendcmd file drives crop x/y, so the crop filter must stay in exactly
+    this shape or the command coordinates fall out of sync with the frame.
+    """
+    if is_short:
+        z = TRACK_ZOOM_SHORT
+        out = f"scale={out_w or 1080}:{out_h or 1080}:flags=lanczos"
+        return (
+            f"scale=iw*{z}:ih*{z},{face_cmd_prefix}"
+            f"crop=w='trunc(min(iw,ih)/{z}/2)*2':h='trunc(min(iw,ih)/{z}/2)*2':"
+            f"x='(iw-ow)/2':y='(ih-oh)/2',{out}"
+        )
+    out = f"scale={out_w or 3456}:{out_h or 1944}"
+    return (
+        f"{face_cmd_prefix}"
+        f"crop=w='trunc(iw/{TRACK_ZOOM_LONG}/2)*2':h='trunc(ih/{TRACK_ZOOM_LONG}/2)*2':"
+        f"x='(iw-ow)/2':y='(ih-oh)/2',{out}"
+    )
+
+
+def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0, out_fps=30.0):
     """
     Subject-tracking (face + body) crop helper.
 
@@ -739,10 +773,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
          Haar misses (small, angled, distant);
       2. Haar cascade fallbacks (frontal → profile face → upper body →
          full body) keep the person framed when no face is visible.
-    The track is smoothed with the 1€ filter plus a gentle speed ceiling so
-    the crop pan stays visually undetectable, and written as an ffmpeg
-    sendcmd commands file that drives the crop filter's x/y so the crop
-    window keeps the subject centred at all times.
+    The track is de-noised (median outlier rejection, gap interpolation) and
+    smoothed with a critically-damped spring, then written as an ffmpeg
+    sendcmd commands file with one command per output frame, so the crop
+    window glides instead of stepping.
 
     Returns the commands file path, or None when tracking is not possible
     (OpenCV missing, no stable subject found, or any error) — the caller then
@@ -767,16 +801,22 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         if not src_w or not src_h or not duration or duration < 1.0:
             return None
 
-        # Mirror of the crop window sizes used by the ffmpeg crop filters below
+        # Mirror of the crop window sizes used by the ffmpeg crop filters below.
+        # NOTE: sendcmd coordinates are expressed in the frame the crop filter
+        # actually sees — for Shorts that frame has already been pre-zoomed.
         if is_short:
-            crop_w = min(src_w, src_h)   # 1:1 square window around the subject
-            crop_h = min(src_w, src_h)
+            # ffmpeg's scale uses int(iw*zoom) (truncation), so mirror that here
+            eff_w = float(int(src_w * TRACK_ZOOM_SHORT))
+            eff_h = float(int(src_h * TRACK_ZOOM_SHORT))
+            crop_w = math.floor(min(eff_w, eff_h) / TRACK_ZOOM_SHORT / 2.0) * 2.0
+            crop_h = crop_w
         else:
-            crop_w = src_w / 1.09
-            crop_h = src_h / 1.09
+            eff_w, eff_h = float(src_w), float(src_h)
+            crop_w = math.floor(src_w / TRACK_ZOOM_LONG / 2.0) * 2.0
+            crop_h = math.floor(src_h / TRACK_ZOOM_LONG / 2.0) * 2.0
 
-        track_x = crop_w < src_w - 4      # room to slide horizontally
-        track_y = crop_h < src_h - 4      # room to slide vertically
+        track_x = crop_w < eff_w - 4      # room to slide horizontally
+        track_y = crop_h < eff_h - 4      # room to slide vertically
         if not track_x and not track_y:
             return None  # window already covers the frame; nothing to follow
 
@@ -816,35 +856,76 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         ]
 
         centers = []  # (cx, cy) in 0..1; None while no subject seen yet
+        prev_c = None  # last accepted subject centre (for "sticky" selection)
+
+        def pick(candidates, prev):
+            """
+            Choose which detection is *our* subject.
+
+            Picking the biggest face is what makes tracking look unstable: the
+            moment a second person walks in, the crop abandons the subject it
+            was following and slides across the frame. So we prefer the face
+            closest to where the subject was last seen, and only fall back to
+            the biggest one when that face has genuinely disappeared.
+            """
+            if not candidates:
+                return None, False
+
+            def ctr(c):
+                return ((c[0] + c[2] / 2) / sample_w, (c[1] + c[3] / 2) / sample_h)
+
+            if prev is not None:
+                best_d, best = None, None
+                for c in candidates:
+                    cx, cy = ctr(c)
+                    d = math.hypot(cx - prev[0], cy - prev[1])
+                    area = c[2] * c[3]
+                    key = (round(d, 4), -area)
+                    if best is None or key < best_d:
+                        best_d, best = key, c
+                if best_d[0] <= 0.30:      # within 30% of frame → same subject
+                    return best, best[4]
+
+            biggest = max(candidates, key=lambda c: c[2] * c[3])
+            return biggest, biggest[4]
+
         while True:
             buf = proc.stdout.read(frame_bytes)
             if len(buf) < frame_bytes:
                 break
             frame = np.frombuffer(buf, np.uint8).reshape(sample_h, sample_w, 3)
-            box = None
-            is_face = False
+            candidates = []
             if yunet is not None:
                 res = yunet.detect(frame)
                 faces = res[1] if isinstance(res, tuple) else res
                 if faces is not None and len(faces) > 0:
-                    f = max(faces, key=lambda r: r[2] * r[3])
-                    box = (f[0], f[1], f[2], f[3])
-                    is_face = True
-            if box is None:
+                    for f in faces:
+                        candidates.append((float(f[0]), float(f[1]), float(f[2]), float(f[3]), True))
+            if not candidates:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 for det, min_sz, nbrs, face_cascade in haar_detectors:
                     found = det.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=nbrs, minSize=min_sz)
                     if len(found) > 0:
-                        box = max(found, key=lambda f: f[2] * f[3])
-                        is_face = face_cascade
+                        for (bx, by, bw, bh) in found:
+                            candidates.append((float(bx), float(by), float(bw), float(bh), bool(face_cascade)))
                         break
+
+            box, is_face = pick(candidates, prev_c)
             if box is not None:
-                bx, by, bw, bh = box
+                bx, by, bw, bh = box[:4]
+                raw_c = ((bx + bw / 2) / sample_w, (by + bh / 2) / sample_h)
                 # For face hits, aim the frame centre at the upper body (chest)
                 # so the body stays framed, not just the head
-                cy = (by + bh / 2) / sample_h + (0.8 * bh / sample_h if is_face else 0.0)
-                centers.append(((bx + bw / 2) / sample_w, min(cy, 1.0)))
+                # Aim a little below the face so chest/shoulders stay in frame,
+                # but CAP the shift: an unbounded chest offset pushes the window
+                # past the top of the available crop room, which is what made
+                # the subject sit 20% off-centre in Shorts.
+                chest = min(0.8 * bh / sample_h, 0.08) if is_face else 0.0
+                cy = raw_c[1] + chest
+                prev_c = raw_c
+                centers.append((raw_c[0], min(cy, 1.0)))
             else:
+                prev_c = None
                 centers.append(None)
         proc.stdout.close()
         proc.wait()
@@ -855,55 +936,120 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             print(f"[subject-track] No stable subject ({found}/{n} samples); keeping static center crop")
             return None
 
-        # Fill gaps: carry the last seen position forward (leading gaps backfill
-        # with the first seen position)
-        first = next(c for c in centers if c is not None)
-        xs, ys = [], []
-        last = first
-        for c in centers:
-            if c is not None:
-                last = c
-            xs.append(last[0])
-            ys.append(last[1])
+        # ── Gap filling ───────────────────────────────────────────────────
+        # Interpolate through short detection gaps instead of freezing on the
+        # last position (freezing, then resuming, is itself a visible jerk).
+        # Gaps longer than ~1.5 s are held so the crop never invents motion.
+        rel_x = [c[0] if c else None for c in centers]
+        rel_y = [c[1] if c else None for c in centers]
+        hold_max = max(2, int(sample_fps * 1.5))
+        for i in range(n):
+            if rel_x[i] is not None:
+                continue
+            lo = i - 1
+            while lo >= 0 and rel_x[lo] is None:
+                lo -= 1
+            hi = i + 1
+            while hi < n and rel_x[hi] is None:
+                hi += 1
+            if lo < 0 and hi >= n:
+                continue
+            if lo < 0:
+                rel_x[i], rel_y[i] = rel_x[hi], rel_y[hi]
+            elif hi >= n or hi - lo > hold_max:
+                rel_x[i], rel_y[i] = rel_x[lo], rel_y[lo]
+            else:
+                f = (i - lo) / float(hi - lo)
+                rel_x[i] = rel_x[lo] + (rel_x[hi] - rel_x[lo]) * f
+                rel_y[i] = rel_y[lo] + (rel_y[hi] - rel_y[lo]) * f
 
-        # Desired crop offsets in source pixels for every sample
-        def targets(rel_x, rel_y):
-            tx = rel_x * src_w - crop_w / 2
-            ty = rel_y * src_h - crop_h / 2
+        # ── Outlier rejection ─────────────────────────────────────────────
+        # A single bad detection (motion blur, a hand in front of the face)
+        # would otherwise drag the whole smoothing filter off for ~1 s.
+        def median3(seq):
+            out = list(seq)
+            for i in range(1, len(seq) - 1):
+                out[i] = sorted((seq[i - 1], seq[i], seq[i + 1]))[1]
+            return out
+
+        rel_x = median3(rel_x)
+        rel_y = median3(rel_y)
+
+        # Desired crop offsets in the *cropped* frame's pixels, for every sample
+        def targets(rel_xv, rel_yv):
+            tx = rel_xv * eff_w - crop_w / 2
+            ty = rel_yv * eff_h - crop_h / 2
             return (
-                min(max(tx, 0), src_w - crop_w),
-                min(max(ty, 0), src_h - crop_h),
+                min(max(tx, 0), eff_w - crop_w),
+                min(max(ty, 0), eff_h - crop_h),
             )
 
-        txs, tys = zip(*[targets(x, y) for x, y in zip(xs, ys)])
+        txs, tys = zip(*[targets(x, y) for x, y in zip(rel_x, rel_y)])
 
-        # 1€ filter smoothing (open source) — jitter-free when the subject is
-        # still, responsive when it moves; a gentle speed ceiling keeps the
-        # crop pan visually undetectable on top of that
-        max_step = max(3.0, crop_w * 0.04)
-        filt_x = OneEuroFilter(sample_fps, min_cutoff=0.4, beta=0.08)
-        filt_y = OneEuroFilter(sample_fps, min_cutoff=0.4, beta=0.08)
-        sm_x, sm_y = [], []
-        px, py = txs[0], tys[0]
-        for tx, ty in zip(txs, tys):
-            px += max(-max_step, min(max_step, filt_x.filter(tx) - px))
-            py += max(-max_step, min(max_step, filt_y.filter(ty) - py))
-            sm_x.append(px)
-            sm_y.append(py)
+        # ── Smoothing ─────────────────────────────────────────────────────
+        # A critically-damped spring, not a dead-band. A dead-band holds still
+        # and then snaps at full speed the moment the subject leaves it — that
+        # "hold … jerk" IS the shake people notice. A spring accelerates and
+        # decelerates continuously, so there is no discontinuity anywhere.
+        # A centred 3-tap pass afterwards is symmetric, so it adds no lag.
+        dt = 1.0 / sample_fps
+        snap_dist = crop_w * 0.35          # bigger than this = scene cut
 
-        # sendcmd works on the OUTPUT timeline (crop sits after setpts=PTS/speed)
-        # START-only commands: each sets the crop offset once and it persists
-        # until the next command overwrites it
+        def spring(track):
+            k, c = 6.0, 4.9                # ωn ≈ 2.45 rad/s, ζ ≈ 1.0
+            vmax = max(40.0, crop_w * 0.05) / dt
+            pos, vel, out = track[0], 0.0, []
+            for target in track:
+                err = target - pos
+                if abs(err) > snap_dist:
+                    # Scene cut: the subject did not travel across the frame,
+                    # the frame replaced itself. Cut with it instead of sliding.
+                    pos, vel = target, 0.0
+                    out.append(pos)
+                    continue
+                vel += (k * err - c * vel) * dt
+                vel = max(-vmax, min(vmax, vel))
+                pos += vel * dt
+                out.append(pos)
+            if len(out) > 2:
+                out = [out[0]] + [
+                    (out[i - 1] + 2.0 * out[i] + out[i + 1]) / 4.0
+                    for i in range(1, len(out) - 1)
+                ] + [out[-1]]
+            return out
+
+        sm_x = spring(txs) if track_x else list(txs)
+        sm_y = spring(tys) if track_y else list(tys)
+
+        def sample_at(track, input_t):
+            """Linear interpolation of the 5 Hz track at any input timestamp."""
+            pos = input_t * sample_fps
+            i = int(math.floor(pos))
+            if i >= len(track) - 1:
+                return track[-1]
+            if i < 0:
+                return track[0]
+            f = pos - i
+            return track[i] + (track[i + 1] - track[i]) * f
+
+        # ── sendcmd on the OUTPUT timeline ────────────────────────────────
+        # crop sits after setpts=PTS/speed → output_time * speed = input_time.
+        # Old code emitted one command every 200 ms (5 Hz): the window held
+        # still, then jumped a chunk. That staircase IS the visible camera
+        # shake. Now there is one command per output frame, interpolated from
+        # the smoothed track, so the window glides instead of stepping.
         out_dur = duration / speed_factor
+        n_out = max(2, int(round(out_dur * out_fps)))
         lines = []
-        for i in range(n):
-            t0 = min(i / sample_fps / speed_factor, out_dur)
+        for k in range(n_out):
+            t_out = k / out_fps
+            t_in = min(t_out * speed_factor, max(duration - 1e-3, 0.0))
             if track_x:
-                x_px = int(round(min(max(sm_x[i], 0), src_w - crop_w)))
-                lines.append(f"{t0:.3f} crop x {x_px};")
+                x_px = int(round(min(max(sample_at(sm_x, t_in), 0), eff_w - crop_w)))
+                lines.append(f"{t_out:.3f} crop x {x_px};")
             if track_y:
-                y_px = int(round(min(max(sm_y[i], 0), src_h - crop_h)))
-                lines.append(f"{t0:.3f} crop y {y_px};")
+                y_px = int(round(min(max(sample_at(sm_y, t_in), 0), eff_h - crop_h)))
+                lines.append(f"{t_out:.3f} crop y {y_px};")
         if not lines:
             return None
 
@@ -1138,7 +1284,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
                 f"split[v_sb][v_sf];"
                 f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
-                f"[v_sf]{face_cmd_prefix}crop='min(iw,ih):min(ih,iw):(iw-ow)/2:(ih-oh)/2',scale=1080:1080:flags=lanczos[v_sqs];"
+                f"[v_sf]{track_crop_chain(face_cmd_prefix, is_short=True)}[v_sqs];"
                 f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2"
                 f"{title_overlay}[v_main_raw]"
             )
@@ -1150,8 +1296,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
                 f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
                 f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
-                f"[v_split2]{face_cmd_prefix}crop=w='trunc(iw/1.09/2)*2':h='trunc(ih/1.09/2)*2':x='(iw-ow)/2':y='(ih-oh)/2',"
-                f"scale=3456:1944[v_fg];"
+                f"[v_split2]{track_crop_chain(face_cmd_prefix, is_short=False)}[v_fg];"
                 f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,"
                 f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
                 f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
@@ -1260,7 +1405,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
                 f"split[v_sb][v_sf];"
                 f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
-                f"[v_sf]{face_cmd_prefix}crop='min(iw,ih):min(ih,iw):(iw-ow)/2:(ih-oh)/2',scale=1080:1080:flags=lanczos[v_sqs];"
+                f"[v_sf]{track_crop_chain(face_cmd_prefix, is_short=True)}[v_sqs];"
                 f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2"
                 f"{title_overlay}"
             )
@@ -1271,8 +1416,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
                 f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
                 f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
-                f"[v_split2]{face_cmd_prefix}crop=w='trunc(iw/1.09/2)*2':h='trunc(ih/1.09/2)*2':x='(iw-ow)/2':y='(ih-oh)/2',"
-                f"scale=3456:1944[v_fg];"
+                f"[v_split2]{track_crop_chain(face_cmd_prefix, is_short=False)}[v_fg];"
                 f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,"
                 f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
                 f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
@@ -1402,7 +1546,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"[0:v]hflip,setpts=PTS/{speed_factor:.4f},"
                 f"split[v_sb][v_sf];"
                 f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
-                f"[v_sf]{face_cmd_prefix}crop='min(iw,ih):min(ih,iw):(iw-ow)/2:(ih-oh)/2',scale=1080:1080:flags=lanczos[v_sqs];"
+                f"[v_sf]{track_crop_chain(face_cmd_prefix, is_short=True)}[v_sqs];"
                 f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2[v]"
             )
         else:
@@ -1412,8 +1556,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
                 f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
                 f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
-                f"[v_split2]{face_cmd_prefix}crop=w='trunc(iw/1.09/2)*2':h='trunc(ih/1.09/2)*2':x='(iw-ow)/2':y='(ih-oh)/2',"
-                f"scale=3456:1944[v_fg];"
+                f"[v_split2]{track_crop_chain(face_cmd_prefix, is_short=False)}[v_fg];"
                 f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1[v]"
             )
 
