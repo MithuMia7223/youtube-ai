@@ -1068,6 +1068,83 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         return None
 
 
+# ── পোড়া কালো বার (letterbox) সনাক্তকরণ ────────────────────────────────────
+def detect_letterbox(path, samples=(0.15, 0.35, 0.55, 0.75, 0.9), limit=24):
+    """
+    উৎস ভিডিওর **ভিতরে পোড়া** কালো বার মাপে এবং `crop=W:H:X:Y` স্ট্রিং ফেরত দেয়
+    (বার না থাকলে None)।
+
+    কেন দরকার: নিচের ফিল্টার-চেইন উৎসকে `scale=1080:1920` করে **স্ট্রেচ** করে, তারপর
+    মাঝখানে স্কয়ার-ক্রপ বসায়। উৎসে যদি সিনেমার মতো উপরে-নিচে কালো বার পোড়া থাকে,
+    স্ট্রেচে সেই বার আরও মোটা হয়ে যায় — ব্যবহারকারীর দেখা "উপরে-নিচে কালো বার"
+    ঠিক এটাই (মাপা: ১০৮০×১৯২০ ফ্রেমে ৬২px + ১৬৪px = ১১.৮%)।
+    """
+    import shutil as _sh, subprocess as _sp
+    from collections import Counter
+    ff = _sh.which("ffmpeg") or "ffmpeg"
+    try:
+        dur = float(_sp.run(
+            [ff, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", "-i", str(path)],
+            capture_output=True, text=True, timeout=60).stdout.strip() or 0)
+    except Exception:
+        dur = 0
+    crops = []
+    for frac in samples:
+        ss = max(0.0, dur * frac) if dur else 0.0
+        try:
+            out = _sp.run(
+                [ff, "-hide_banner", "-nostats", "-ss", f"{ss:.2f}", "-i", str(path),
+                 "-vf", f"cropdetect=limit={limit}:round=2:reset=0", "-frames:v", "12",
+                 "-f", "null", "-"],
+                capture_output=True, text=True, timeout=120).stderr
+        except Exception:
+            continue
+        for line in out.splitlines():
+            if "crop=" in line:
+                crops.append(line.split("crop=")[-1].split()[0])
+    if not crops:
+        return None
+    best, _n = Counter(crops).most_common(1)[0]
+    try:
+        w, h, x, y = (int(v) for v in best.split(":"))
+    except Exception:
+        return None
+
+    # ── বৈধতা যাচাই ─────────────────────────────────────────────────────
+    # এক-রঙা/এজবিহীন ফ্রেমে cropdetect মাঝে মাঝে আবর্জনা দেয় (যেমন
+    # crop=-1278:-718:1280:720)। সেগুলো বাদ না দিলে পরিষ্কার ভিডিওতেও
+    # ভুল ক্রপ বসে ফ্রেম নষ্ট হয়ে যেত।
+    iw, ih = probe_size(path)
+    if not iw or not ih:
+        return None
+    if w <= 0 or h <= 0 or x < 0 or y < 0:
+        return None
+    if w > iw or h > ih or x + w > iw + 2 or y + h > ih + 2:
+        return None
+    if w >= iw - 4 and h >= ih - 4:      # পুরো ফ্রেম = বার নেই
+        return None
+    # খুব ছোট পার্থক্য (<১.৫%) উপেক্ষা — কোডেক-নয়েজ, আসল বার নয়
+    if (iw - w) < iw * 0.015 and (ih - h) < ih * 0.015:
+        return None
+    return f"crop={w}:{h}:{x}:{y},"
+
+
+def probe_size(path):
+    """(width, height) — ffprobe ছাড়াই ffmpeg stderr থেকে।"""
+    import re as _re, shutil as _sh, subprocess as _sp
+    ff = _sh.which("ffmpeg") or "ffmpeg"
+    try:
+        err = _sp.run([ff, "-hide_banner", "-i", str(path)],
+                      capture_output=True, text=True, timeout=60).stderr
+        m = _re.search(r"Video:.*?, (\d{2,5})x(\d{2,5})", err)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return 0, 0
+
+
 def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_dir="assets/audio", mix_bgm=True, video_title=None, thumb_path=None, srt_path=None, intro_path=None, outro_path=None, avatar_path=None, narration_path=None):
     """
     Apply hard-level copyright bypass filters using synced FFmpeg commands:
@@ -1179,6 +1256,17 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     # Input 0: Main video
     cmd_inputs += ["-i", input_path]
     main_idx = 0
+
+    # উৎসে পোড়া কালো বার থাকলে আগেই কেটে নিই (নইলে স্ট্রেচে বার মোটা হয়)
+    bars_prefix = ""
+    try:
+        _bars = detect_letterbox(input_path)
+        if _bars:
+            bars_prefix = _bars
+            print(f"[letterbox] উৎসের কালো বার কাটা হচ্ছে: {_bars.rstrip(',')}")
+    except Exception as _e:
+        print(f"[letterbox] সনাক্তকরণ ব্যর্থ (উপেক্ষা): {_e}")
+
     inputs_count = 1
     
     bgm_idx = -1
@@ -1279,7 +1367,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         # ── Main video ──────────────────────────────────────────────────────
         if is_short:
             v_main = (
-                f"[{main_idx}:v]hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"[{main_idx}:v]{bars_prefix}hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
                 f"split[v_sb][v_sf];"
@@ -1292,7 +1380,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         else:
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
             parts.append(
-                f"[{main_idx}:v]hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"[{main_idx}:v]{bars_prefix}hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
                 f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
                 f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
@@ -1400,7 +1488,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         vf_parts = []
         if is_short:
             v_main = (
-                f"[{main_idx}:v]hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"[{main_idx}:v]{bars_prefix}hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
                 f"split[v_sb][v_sf];"
@@ -1412,7 +1500,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         else:
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
             v_main = (
-                f"[{main_idx}:v]hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"[{main_idx}:v]{bars_prefix}hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
                 f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
                 f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
