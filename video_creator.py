@@ -24,6 +24,25 @@ load_dotenv()
 
 _encoder_cache = None
 
+# বাংলা টেক্সটের যুক্তাক্ষর/কার-চিহ্ন ঠিকভাবে আঁকতে NFD দরকার — Pillow-এ
+# libraqm নেই (features.check('raqm') == False), তাই NFC-তে "কোথায়"-এর
+# ো-কার ভেঙে ডটেড সার্কেল (◌) দেখায়। NFD-তে সঠিকভাবে বসে।
+import unicodedata as _ud
+
+
+def bn(txt: str) -> str:
+    """বাংলা লেখা আঁকার আগে NFD নরমালাইজ (Pillow shaping-সীমাবদ্ধতার সমাধান)।"""
+    return _ud.normalize("NFD", txt or "")
+
+# ── ভিডিও লুক সেটিংস ───────────────────────────────────────────────────────────
+# BLACK_BARS: ভিডিয়োর উপরে/নিচে কালো বার (টাইটেল/সাবটাইটেল বক্স) দেখাবে কি না।
+# টাইটেল/ডায়ালগ তখনও দেখাবে — শুধু বারের বদলে আউটলাইন (stroke) থাকবে,
+# ফলে ফুটেজ পুরো ফ্রেম জুড়ে (full-bleed) থাকবে। False = বার নেই।
+BLACK_BARS = False
+
+# HD_OUTPUT: আউটপুট 1080p (1080×1920 / 1920×1080)। False করলে 4K রেন্ডার হবে।
+HD_OUTPUT = True
+
 def get_best_encoder():
     """Determine the best available video encoder (hardware accelerated if possible)."""
     global _encoder_cache
@@ -112,31 +131,58 @@ def _generate_audio(text: str, voice_key: str, output_path: str,
     voice_name = VOICES.get(voice_key, VOICES[DEFAULT_VOICE])
     clean_text = clean_tts_text(text)[:4500].strip()
 
-    # Use edge-tts (Microsoft Neural TTS) — free & very clear
-    try:
-        import asyncio
-        import edge_tts
+    # Use edge-tts (Microsoft Neural TTS) — free & very clear.
+    # Called through its CLI (subprocess) rather than the Python API: the API
+    # path and the CLI path use the same engine, but the in-process API kept
+    # returning "No audio received" on this machine while the CLI works.
+    import subprocess
+    import sys
+    import time
 
-        async def _tts_async():
-            communicate = edge_tts.Communicate(clean_text, voice_name)
-            await communicate.save(output_path)
+    def _valid(path):
+        return os.path.exists(path) and os.path.getsize(path) > 2000
 
-        asyncio.run(_tts_async())
-        _progress("✅ Neural ভয়েসওভার সম্পন্ন (Microsoft Edge TTS)", cb)
-        return output_path
-
-    except Exception as e:
-        _progress(f"⚠️ Edge TTS ব্যর্থ, gTTS দিয়ে চেষ্টা করা হচ্ছে... ({e})", cb)
-        # Fallback to gTTS
+    def _cleanup(path):
         try:
-            from gtts import gTTS
-            lang = "bn" if "bn" in voice_key else ("hi" if "hi" in voice_key else "en")
-            tts = gTTS(text=clean_text[:4000], lang=lang)
-            tts.save(output_path)
-            _progress("✅ ভয়েসওভার সম্পন্ন (gTTS fallback)", cb)
-            return output_path
-        except Exception as e2:
-            raise RuntimeError(f"TTS সম্পূর্ণ ব্যর্থ: {e2}")
+            if os.path.exists(path) and os.path.getsize(path) < 2000:
+                os.remove(path)
+        except Exception:
+            pass
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            _cleanup(output_path)
+            subprocess.run(
+                [sys.executable, "-m", "edge_tts",
+                 "--voice", voice_name,
+                 "--text", clean_text,
+                 "--write-media", output_path],
+                check=True, capture_output=True, text=True, timeout=180,
+            )
+            if _valid(output_path):
+                _progress("✅ Neural ভয়েসওভার সম্পন্ন (Microsoft Edge TTS)", cb)
+                return output_path
+            last_err = "empty audio file"
+        except Exception as e:
+            last_err = e
+        time.sleep(2 * (attempt + 1))
+
+    _progress(f"⚠️ Edge TTS ব্যর্থ, gTTS দিয়ে চেষ্টা করা হচ্ছে... ({last_err})", cb)
+    # Fallback to gTTS
+    try:
+        from gtts import gTTS
+        lang = "bn" if "bn" in voice_key else ("hi" if "hi" in voice_key else "en")
+        _cleanup(output_path)
+        tts = gTTS(text=clean_text[:4000], lang=lang)
+        tts.save(output_path)
+        if not _valid(output_path):
+            raise RuntimeError("gTTS produced an empty file")
+        _progress("✅ ভয়েসওভার সম্পন্ন (gTTS fallback)", cb)
+        return output_path
+    except Exception as e2:
+        _cleanup(output_path)
+        raise RuntimeError(f"TTS সম্পূর্ণ ব্যর্থ: {e2}")
 
 
 # ── Step 2: Split Script into Scenes ───────────────────────────────────
@@ -566,7 +612,10 @@ def _generate_scene_media(scene_text: str, topic: str, scene_idx: int,
     
     # If no image path is resolved, we create a fallback blank image in 4K HD
     if not final_img_path:
-        w, h = (2160, 3840) if is_short else (3840, 2160)
+        if HD_OUTPUT:
+            w, h = (1080, 1920) if is_short else (1920, 1080)
+        else:
+            w, h = (2160, 3840) if is_short else (3840, 2160)
         pil_img = Image.new("RGB", (w, h), color=(15, 15, 35))
         pil_img.save(img_path)
         final_img_path = img_path
@@ -655,6 +704,91 @@ def prepare_cinematic_source(img: Image.Image, target_w: int, target_h: int, ove
     os_h = int(target_h * overscan)
     return base_canvas.resize((os_w, os_h), Image.LANCZOS)
 
+def cinematic_camera_offsets(
+    source_size: tuple[int, int],
+    target_w: int,
+    target_h: int,
+    t: float,
+    duration: float,
+    shot_idx: int = 0,
+    shot_type: str | None = None,
+):
+    """
+    Pure geometry for the virtual camera: returns (left, top, crop_w, crop_h)
+    as FLOATS so the caller can crop with sub-pixel precision.
+
+    Jitter fix notes:
+      * drift frequencies are low (0.4–0.9 rad/s) and amplitude is capped at
+        ~0.25% of the frame — reads as "breathing", not vibration;
+      * nothing is rounded here, so no 1px staircase on slow pans.
+    """
+    if shot_type is None:
+        shot_type = CINEMATIC_SHOT_CYCLE[shot_idx % len(CINEMATIC_SHOT_CYCLE)]
+
+    dur = max(duration, 0.1)
+    progress = min(max(t / dur, 0.0), 1.0)
+
+    # Cinematic smoothstep curve: ease-in, smooth constant velocity, ease-out
+    smooth_p = progress * progress * (3.0 - 2.0 * progress)
+
+    os_w, os_h = source_size
+    max_dx = max(os_w - target_w, 0)
+    max_dy = max(os_h - target_h, 0)
+    center_x = max_dx / 2.0
+    center_y = max_dy / 2.0
+
+    # Organic handheld "breathing" — deliberately slow + small.
+    seed = (shot_idx + 1) * 23.47
+    drift_x = (math.sin(t * 0.90 + seed) * 0.0016 + math.sin(t * 0.41 + seed * 2) * 0.0009) * target_w
+    drift_y = (math.cos(t * 0.78 + seed) * 0.0016 + math.sin(t * 0.63 + seed * 3) * 0.0008) * target_h
+
+    # Calculate scale factor and camera focal position
+    if shot_type == CinematicShotType.DOLLY_IN:
+        zoom = 1.0 + 0.06 * smooth_p
+        pan_x = center_x + drift_x
+        pan_y = center_y * 0.85 + drift_y  # Biased slightly upwards toward eye-line
+
+    elif shot_type == CinematicShotType.DOLLY_OUT:
+        zoom = 1.07 - 0.05 * smooth_p
+        pan_x = center_x + drift_x
+        pan_y = center_y + drift_y
+
+    elif shot_type == CinematicShotType.PAN_RIGHT:
+        zoom = 1.06
+        pan_x = center_x - (max_dx * 0.28) + (max_dx * 0.56) * smooth_p + drift_x
+        pan_y = center_y + drift_y
+
+    elif shot_type == CinematicShotType.PAN_LEFT:
+        zoom = 1.06
+        pan_x = center_x + (max_dx * 0.28) - (max_dx * 0.56) * smooth_p + drift_x
+        pan_y = center_y + drift_y
+
+    elif shot_type == CinematicShotType.PEDESTAL_UP:
+        zoom = 1.07
+        pan_x = center_x + drift_x
+        pan_y = center_y + (max_dy * 0.22) - (max_dy * 0.44) * smooth_p + drift_y
+
+    elif shot_type == CinematicShotType.TILT_DOWN:
+        zoom = 1.07
+        pan_x = center_x + drift_x
+        pan_y = center_y - (max_dy * 0.16) + (max_dy * 0.32) * smooth_p + drift_y
+
+    else:  # DIAGONAL
+        zoom = 1.02 + 0.05 * smooth_p
+        pan_x = center_x - (max_dx * 0.20) + (max_dx * 0.40) * smooth_p + drift_x
+        pan_y = center_y - (max_dy * 0.16) + (max_dy * 0.32) * smooth_p + drift_y
+
+    crop_w = target_w / zoom
+    crop_h = target_h / zoom
+
+    left = pan_x - (crop_w - target_w) / 2.0
+    top = pan_y - (crop_h - target_h) / 2.0
+
+    left = max(0.0, min(float(max(os_w - crop_w, 0)), left))
+    top = max(0.0, min(float(max(os_h - crop_h, 0)), top))
+    return left, top, crop_w, crop_h
+
+
 def render_cinematic_camera_frame(
     source_overscan: Image.Image,
     target_w: int,
@@ -671,88 +805,26 @@ def render_cinematic_camera_frame(
       2. Dynamic camera motion per shot type (dolly push, reveal pull-out, tracking pans, pedestal crane)
       3. Organic camera 'breathing' & subtle handheld micro-drift (sinusoidal frequency harmonics)
       4. Safe boundary bounds prevention
-    """
-    if shot_type is None:
-        shot_type = CINEMATIC_SHOT_CYCLE[shot_idx % len(CINEMATIC_SHOT_CYCLE)]
 
-    dur = max(duration, 0.1)
-    progress = min(max(t / dur, 0.0), 1.0)
-    
-    # Cinematic smoothstep curve: ease-in, smooth constant velocity, ease-out
-    smooth_p = progress * progress * (3.0 - 2.0 * progress)
+    Sub-pixel trick: the crop box is taken with floor/ceil (1–2px of padding) and
+    then resampled down to the target size. That folds the fractional part of the
+    camera position into the resample instead of truncating it, so slow pans no
+    longer stair-step by a whole pixel every frame.
+    """
+    left, top, crop_w, crop_h = cinematic_camera_offsets(
+        source_overscan.size, target_w, target_h, t, duration, shot_idx, shot_type
+    )
 
     os_w, os_h = source_overscan.size
-    max_dx = max(os_w - target_w, 0)
-    max_dy = max(os_h - target_h, 0)
-    center_x = max_dx / 2.0
-    center_y = max_dy / 2.0
+    x0 = max(0, int(math.floor(left)))
+    y0 = max(0, int(math.floor(top)))
+    x1 = min(os_w, int(math.ceil(left + crop_w)) + 1)
+    y1 = min(os_h, int(math.ceil(top + crop_h)) + 1)
 
-    # Organic handheld camera micro-drift (simulating human Steadicam operator breathing)
-    seed = (shot_idx + 1) * 23.47
-    drift_x = (math.sin(t * 1.4 + seed) * 0.003 + math.sin(t * 0.65 + seed * 2) * 0.0018) * target_w
-    drift_y = (math.cos(t * 1.2 + seed) * 0.003 + math.sin(t * 0.81 + seed * 3) * 0.0015) * target_h
-
-    # Calculate scale factor and camera focal position
-    if shot_type == CinematicShotType.DOLLY_IN:
-        # Start at 1.0 (relative to target) and smoothly push in to 1.12 towards upper third (face)
-        zoom = 1.0 + 0.10 * smooth_p
-        pan_x = center_x + drift_x
-        pan_y = center_y * 0.85 + drift_y  # Biased slightly upwards toward eye-line
-
-    elif shot_type == CinematicShotType.DOLLY_OUT:
-        # Start zoomed in 1.12 and smoothly pull back to reveal scene
-        zoom = 1.10 - 0.09 * smooth_p
-        pan_x = center_x + drift_x
-        pan_y = center_y + drift_y
-
-    elif shot_type == CinematicShotType.PAN_RIGHT:
-        # Steady cinematic tracking shot left to right
-        zoom = 1.06
-        pan_x = center_x - (max_dx * 0.35) + (max_dx * 0.70) * smooth_p + drift_x
-        pan_y = center_y + drift_y
-
-    elif shot_type == CinematicShotType.PAN_LEFT:
-        # Steady cinematic tracking shot right to left
-        zoom = 1.06
-        pan_x = center_x + (max_dx * 0.35) - (max_dx * 0.70) * smooth_p + drift_x
-        pan_y = center_y + drift_y
-
-    elif shot_type == CinematicShotType.PEDESTAL_UP:
-        # Crane / pedestal glide up from mid torso to eyes
-        zoom = 1.07
-        pan_x = center_x + drift_x
-        pan_y = center_y + (max_dy * 0.30) - (max_dy * 0.60) * smooth_p + drift_y
-
-    elif shot_type == CinematicShotType.TILT_DOWN:
-        # Smooth tilt down from face to lower action
-        zoom = 1.07
-        pan_x = center_x + drift_x
-        pan_y = center_y - (max_dy * 0.25) + (max_dy * 0.50) * smooth_p + drift_y
-
-    else:  # DIAGONAL
-        # Dramatic diagonal dolly + micro push
-        zoom = 1.02 + 0.08 * smooth_p
-        pan_x = center_x - (max_dx * 0.25) + (max_dx * 0.50) * smooth_p + drift_x
-        pan_y = center_y - (max_dy * 0.20) + (max_dy * 0.40) * smooth_p + drift_y
-
-    # Calculate crop window based on current zoom and pan
-    crop_w = target_w / zoom
-    crop_h = target_h / zoom
-
-    left = pan_x - (crop_w - target_w) / 2.0
-    top = pan_y - (crop_h - target_h) / 2.0
-
-    # Clamp safely inside overscan canvas
-    left = max(0.0, min(float(max(os_w - crop_w, 0)), left))
-    top = max(0.0, min(float(max(os_h - crop_h), top)) )
-
-    crop_box = (int(left), int(top), int(left + crop_w), int(top + crop_h))
-    cropped = source_overscan.crop(crop_box)
-    
-    if cropped.size != (target_w, target_h):
-        cropped = cropped.resize((target_w, target_h), Image.BILINEAR)
-
-    return cropped
+    region = source_overscan.crop((x0, y0, x1, y1))
+    if region.size != (target_w, target_h):
+        region = region.resize((target_w, target_h), Image.LANCZOS)
+    return region
 
 
 # ── Step 4: Build Video from Images + Audio ───────────────────────────────────
@@ -764,6 +836,8 @@ def apply_short_romantic_template(pil_img: Image.Image, title: str, subtitle: st
     import math
     from PIL import ImageDraw, ImageFont, Image
     w, h = pil_img.size
+    # ৪K (2160×3840) বেসলাইন থেকে স্কেল — ১০৮০p-তেও সব লেখা/পার্টিকেল ফ্রেমের ভিতরে থাকে
+    k = w / 2160.0
     
     # Create copy to draw on
     canvas = pil_img.copy()
@@ -773,10 +847,11 @@ def apply_short_romantic_template(pil_img: Image.Image, title: str, subtitle: st
     top_h = int(h * 0.12)
     bot_h = int(h * 0.28)
     bot_start = h - bot_h
-    for row in range(bot_h):
-        alpha = int(210 * (row / bot_h) ** 0.7)
-        draw.line([(0, bot_start + row), (w, bot_start + row)], fill=(0, 0, 0))
-    draw.rectangle([0, 0, w, top_h], fill=(0, 0, 0))
+    if BLACK_BARS:                      # False হলে বার নেই — শুধু টেক্সট (stroke)
+        for row in range(bot_h):
+            alpha = int(210 * (row / bot_h) ** 0.7)
+            draw.line([(0, bot_start + row), (w, bot_start + row)], fill=(0, 0, 0))
+        draw.rectangle([0, 0, w, top_h], fill=(0, 0, 0))
     
     # 2. Load fonts
     font_paths = [
@@ -797,15 +872,15 @@ def apply_short_romantic_template(pil_img: Image.Image, title: str, subtitle: st
                     continue
         return ImageFont.load_default(size=size)
         
-    font_title = get_font(96)
-    font_sub = get_font(84)
-    font_watermark = get_font(72)
+    font_title = get_font(max(24, int(96 * k)))
+    font_sub = get_font(max(22, int(84 * k)))
+    font_watermark = get_font(max(18, int(72 * k)))
     
     # 3. Draw title text in top bar (white with red outline / stroke)
     if title:
         import textwrap
-        wrapped_title = textwrap.wrap(title.strip(), width=24)
-        title_y = 250 - (len(wrapped_title) * 110) // 2
+        wrapped_title = textwrap.wrap(bn(title.strip()), width=24)
+        title_y = int(250 * k) - (len(wrapped_title) * int(110 * k)) // 2
         for line in wrapped_title:
             try:
                 bbox = draw.textbbox((0, 0), line, font=font_title)
@@ -821,14 +896,14 @@ def apply_short_romantic_template(pil_img: Image.Image, title: str, subtitle: st
                 for ox, oy in [(-3, -3), (3, -3), (-3, 3), (3, 3)]:
                     draw.text((x+ox, title_y+oy), line, font=font_title, fill="#D32F2F")
                 draw.text((x, title_y), line, font=font_title, fill="white")
-            title_y += 110
+            title_y += int(110 * k)
 
     # 4. Draw subtitle text in the middle area (yellow with black outline)
     if subtitle:
         import textwrap
-        wrapped_sub = textwrap.wrap(subtitle.strip(), width=26)
-        total_sub_h = len(wrapped_sub) * 95
-        sub_y = 3000 - total_sub_h
+        wrapped_sub = textwrap.wrap(bn(subtitle.strip()), width=26)
+        total_sub_h = len(wrapped_sub) * int(95 * k)
+        sub_y = int(h * 0.795) - total_sub_h
         for line in wrapped_sub:
             try:
                 bbox = draw.textbbox((0, 0), line, font=font_sub)
@@ -843,7 +918,7 @@ def apply_short_romantic_template(pil_img: Image.Image, title: str, subtitle: st
                 for ox, oy in [(-2, -2), (2, -2), (-2, 2), (2, 2)]:
                     draw.text((x+ox, sub_y+oy), line, font=font_sub, fill="black")
                 draw.text((x, sub_y), line, font=font_sub, fill="yellow")
-            sub_y += 95
+            sub_y += int(95 * k)
 
     # 5. Draw snow particles (floating in the middle area: y=500 to y=3320)
     for idx in range(35):
@@ -853,16 +928,16 @@ def apply_short_romantic_template(pil_img: Image.Image, title: str, subtitle: st
         seed_radius = (idx * 7.19) % 1.0
         seed_phase = (idx * 3.47) % 1.0
         
-        h_start = 500
-        h_end = 3320
+        h_start = int(h * 0.14)
+        h_end = int(h * 0.88)
         h_span = h_end - h_start
         
-        radius = int(8 + seed_radius * 16)
+        radius = max(2, int((8 + seed_radius * 16) * k))
         x_center = seed_x * w
-        speed = 100 + seed_speed * 120
+        speed = (100 + seed_speed * 120) * k
         
         y = h_start + (seed_y * h_span + speed * t) % h_span
-        sway = 30 * math.sin(1.5 * t + seed_phase * 6.28)
+        sway = 30 * k * math.sin(1.5 * t + seed_phase * 6.28)
         x = (x_center + sway) % w
         
         try:
@@ -879,25 +954,40 @@ def apply_short_romantic_template(pil_img: Image.Image, title: str, subtitle: st
         except Exception:
             draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=(255, 255, 255))
             
-    # 6. Draw romantic watermark at the bottom of the middle video
-    watermark = "ME ❤ JAN"
-    try:
-        bbox = draw.textbbox((0, 0), watermark, font=font_watermark)
-        wm_w = bbox[2] - bbox[0]
-        wm_h = bbox[3] - bbox[1]
-    except AttributeError:
-        wm_w, wm_h = draw.textsize(watermark, font=font_watermark)
-    
-    wm_x = (w - wm_w) // 2
-    wm_y = 3200
-    
-    try:
-        draw.text((wm_x, wm_y), watermark, font=font_watermark, fill="white", stroke_width=5, stroke_fill="#E53935")
-    except TypeError:
-        for ox, oy in [(-2, -2), (2, -2), (-2, 2), (2, 2)]:
-            draw.text((wm_x+ox, wm_y+oy), watermark, font=font_watermark, fill="#E53935")
-        draw.text((wm_x, wm_y), watermark, font=font_watermark, fill="white")
-        
+    # 6. Watermark: "ME ♥ JAN" — হৃদয়টা ভেক্টর দিয়ে আঁকা হয়, কারণ
+    #    বাংলা ফন্টগুলোতে ❤/♥ গ্লিফ থাকে না (□ "টফু" দেখাত)
+    def _heart(d, cx, cy, size, fill):
+        r = size * 0.30
+        d.ellipse([cx - size * 0.5, cy - size * 0.34, cx - size * 0.5 + 2 * r, cy - size * 0.34 + 2 * r], fill=fill)
+        d.ellipse([cx + size * 0.5 - 2 * r, cy - size * 0.34, cx + size * 0.5, cy - size * 0.34 + 2 * r], fill=fill)
+        d.polygon([(cx - size * 0.5, cy - size * 0.10),
+                   (cx + size * 0.5, cy - size * 0.10),
+                   (cx, cy + size * 0.55)], fill=fill)
+
+    def _tw(txt):
+        try:
+            bb = draw.textbbox((0, 0), txt, font=font_watermark)
+            return bb[2] - bb[0]
+        except AttributeError:
+            return draw.textsize(txt, font=font_watermark)[0]
+
+    left_txt, right_txt = "ME", "JAN"
+    heart_sz = int(72 * k)
+    gap = int(14 * k)
+    total_w = _tw(left_txt) + gap * 2 + heart_sz + _tw(right_txt)
+    wm_x = (w - total_w) // 2
+    wm_y = int(h * 0.885)
+    heart_cy = wm_y + int(heart_sz * 0.42)
+
+    for piece in (left_txt,):
+        draw.text((wm_x, wm_y), piece, font=font_watermark, fill="white",
+                  stroke_width=max(2, int(5 * k)), stroke_fill="#E53935")
+    hx = wm_x + _tw(left_txt) + gap
+    _heart(draw, hx + heart_sz / 2, heart_cy, heart_sz, "#E53935")
+    _heart(draw, hx + heart_sz / 2, heart_cy - 1, heart_sz * 0.78, "#FF5252")
+    draw.text((hx + heart_sz + gap, wm_y), right_txt, font=font_watermark,
+              fill="white", stroke_width=max(2, int(5 * k)), stroke_fill="#E53935")
+
     return canvas
 
 
@@ -945,7 +1035,7 @@ def draw_subtitle_on_image(pil_img: Image.Image, text: str, is_short: bool) -> I
             font = ImageFont.load_default()
 
     # 3. Wrap text
-    wrapped_lines = textwrap.wrap(text.strip()[:120], width=char_width)
+    wrapped_lines = textwrap.wrap(bn(text.strip()[:120]), width=char_width)
     if not wrapped_lines:
         return pil_img
 
@@ -1005,8 +1095,11 @@ def _build_image_video(scenes: list[dict], audio_path: str, output_path: str,
     from PIL import Image
     import numpy as np
 
-    # Render in premium 4K HD resolution (2160x3840 for Shorts, 3840x2160 for Long)
-    w, h = (2160, 3840) if is_short else (3840, 2160)
+    # আউটপুট: HD_OUTPUT=True হলে 1080p (1080×1920 / 1920×1080), নইলে 4K
+    if HD_OUTPUT:
+        w, h = (1080, 1920) if is_short else (1920, 1080)
+    else:
+        w, h = (2160, 3840) if is_short else (3840, 2160)
     clips = []
 
     # Check if we have individual scene audio files
@@ -1052,31 +1145,33 @@ def _build_image_video(scenes: list[dict], audio_path: str, output_path: str,
                     
                     # Trim or pad to scene_duration
                     if clip.duration > curr_scene_duration:
-                        clip = clip.subclip(0, curr_scene_duration)
+                        clip = clip.subclipped(0, curr_scene_duration)
                     else:
                         clip = clip.with_duration(curr_scene_duration)
-                    
+
                     if is_short:
-                        middle_w, middle_h = 2160, 2820
+                        # পুরো 9:16 ফ্রেম ভরাট (cover + center-crop) — কোনো কালো বার নেই।
+                        # আগে ক্লিপটা ২১৬০×২৮২০-র মাঝের পট്ടিতে বসানো হতো, তাই
+                        # উপরে-নিচে বড় কালো বার পড়ত।
                         clip_w, clip_h = clip.size
-                        scale = middle_w / clip_w
-                        new_w = middle_w
-                        new_h = int(clip_h * scale)
-                        if new_h > middle_h:
-                            scale = middle_h / clip_h
-                            new_h = middle_h
-                            new_w = int(clip_w * scale)
-                        clip = clip.resize((new_w, new_h))
-                        
-                        black_bg = ColorClip(size=(w, h), color=(0, 0, 0), duration=curr_scene_duration)
-                        y_pos = 500 + (middle_h - new_h) // 2
-                        x_pos = (middle_w - new_w) // 2
-                        clip = CompositeVideoClip([black_bg, clip.set_position((x_pos, y_pos))])
-                        
-                        # Apply template to video frames
-                        clip = clip.fl(lambda gf, t: np.array(apply_short_romantic_template(Image.fromarray(gf(t)), topic, scene_text, t)))
+                        scale = max(w / clip_w, h / clip_h)
+                        new_w, new_h = int(round(clip_w * scale)), int(round(clip_h * scale))
+                        clip = clip.resized((new_w, new_h))
+                        clip = clip.cropped(
+                            x_center=new_w / 2, y_center=new_h / 2,
+                            width=w, height=h,
+                        )
+
+                        # টেমপ্লেট (টাইটেল/সাবটাইটেল) — বার ছাড়া
+                        clip = clip.image_transform(
+                            lambda gf, t: np.array(
+                                apply_short_romantic_template(
+                                    Image.fromarray(gf(t)), topic, scene_text, t
+                                )
+                            )
+                        )
                     else:
-                        clip = clip.resize((w, h))
+                        clip = clip.resized((w, h))
                 except Exception as e:
                     _progress(f"⚠️ দৃশ্য {idx+1}: ভিডিও লোড ব্যর্থ: {e}", cb)
                     clip = ColorClip(size=(w, h), color=(15, 15, 35), duration=curr_scene_duration)
@@ -1168,7 +1263,6 @@ def _build_image_video(scenes: list[dict], audio_path: str, output_path: str,
             audio_codec="aac",
             logger=None,
             threads=2,
-            verbose=False,
         )
     except Exception as e:
         if codec_choice != "libx264":
@@ -1182,7 +1276,6 @@ def _build_image_video(scenes: list[dict], audio_path: str, output_path: str,
                 audio_codec="aac",
                 logger=None,
                 threads=2,
-                verbose=False,
             )
         else:
             raise e
@@ -1369,23 +1462,25 @@ def draw_drama_frame(
     bot_h = int(h * 0.36)   # bottom 36%
     top_clr, _ = EMOTION_COLORS.get(emotion, ((10, 10, 30), (10, 10, 30)))
 
-    # Draw semi-transparent top bar
-    try:
-        overlay = Image.new("RGBA", (w, top_h), (*top_clr, 200))
-        pil_img.paste(Image.fromarray(
-            __import__('numpy').array(overlay)[:, :, :3], 'RGB'), (0, 0))
-    except Exception:
-        draw.rectangle([0, 0, w, top_h], fill=(*top_clr, ))
+    # Draw semi-transparent top bar (BLACK_BARS=False হলে বাদ)
+    if BLACK_BARS:
+        try:
+            overlay = Image.new("RGBA", (w, top_h), (*top_clr, 200))
+            pil_img.paste(Image.fromarray(
+                __import__('numpy').array(overlay)[:, :, :3], 'RGB'), (0, 0))
+        except Exception:
+            draw.rectangle([0, 0, w, top_h], fill=(*top_clr, ))
 
     # ── 3. Bottom dark gradient for subtitle area ────────────────────────────
     bot_start = h - bot_h
-    try:
-        for row in range(bot_h):
-            alpha = int(220 * (row / bot_h) ** 0.7)
-            draw.line([(0, bot_start + row), (w, bot_start + row)],
-                      fill=(0, 0, 0))
-    except Exception:
-        draw.rectangle([0, bot_start, w, h], fill=(0, 0, 0))
+    if BLACK_BARS:
+        try:
+            for row in range(bot_h):
+                alpha = int(220 * (row / bot_h) ** 0.7)
+                draw.line([(0, bot_start + row), (w, bot_start + row)],
+                          fill=(0, 0, 0))
+        except Exception:
+            draw.rectangle([0, bot_start, w, h], fill=(0, 0, 0))
 
     # ── 4. Load fonts ────────────────────────────────────────────────────────
     font_paths = [
@@ -1426,7 +1521,7 @@ def draw_drama_frame(
             d.text((x, y), txt, font=fnt, fill=fill)
 
     # ── 6. Character name badge (top bar) ────────────────────────────────────
-    char_display = character if character != "NARRATOR" else "💬 বর্ণনা"
+    char_display = bn(character if character != "NARRATOR" else "বর্ণনা")
     char_color = CHARACTER_COLORS.get(character, "#FFFFFF")
 
     try:
@@ -1437,29 +1532,31 @@ def draw_drama_frame(
         name_w, name_h = draw.textsize(char_display, font=font_name)
 
     name_x = int(w * 0.06)
-    name_y = int(top_h * 0.15)
+    # বার থাকলে বারের ভিতরে, না থাকলে নিরাপদ মার্জিনে (উপরের গ্লিফ কাটা পড়ে না)
+    name_y = int(top_h * 0.15) if BLACK_BARS else int(h * 0.035)
 
-    # Badge background pill
+    # Badge background pill (শুধু BLACK_BARS=True হলে)
     pad = int(w * 0.02)
     badge_rect = [name_x - pad, name_y - pad // 2,
                   name_x + name_w + pad, name_y + name_h + pad // 2]
-    try:
-        # Draw rounded rectangle badge
-        br = int(w * 0.025)
-        draw.rounded_rectangle(badge_rect, radius=br,
-                                fill=(0, 0, 0, 180), outline=char_color, width=4)
-    except AttributeError:
-        draw.rectangle(badge_rect, fill=(0, 0, 0), outline=char_color, width=3)
+    if BLACK_BARS:
+        try:
+            br = int(w * 0.025)
+            draw.rounded_rectangle(badge_rect, radius=br,
+                                   fill=(0, 0, 0, 180), outline=char_color, width=4)
+        except AttributeError:
+            draw.rectangle(badge_rect, fill=(0, 0, 0), outline=char_color, width=3)
 
     draw_text_stroke(draw, name_x, name_y, char_display, font_name,
                      fill=char_color, stroke_fill=(0, 0, 0), stroke_w=3)
 
     # ── 7. Emotion badge (top-right corner) ─────────────────────────────────
-    emotion_emoji = {
-        "sad": "😢 দুঃখ", "crying": "😭 কান্না", "angry": "😠 রাগ",
-        "shocked": "😱 অবাক", "loving": "❤️ ভালোবাসা",
-        "desperate": "💔 হতাশ", "hopeful": "🌟 আশা",
-    }.get(emotion, f"🎭 {emotion}")
+    # ইমোজি বাদ: বাংলা ফন্টে ওগুলোর গ্লিফ নেই → □ (টফু) দেখায়
+    emotion_emoji = bn({
+        "sad": "দুঃখ", "crying": "কান্না", "angry": "রাগ",
+        "shocked": "অবাক", "loving": "ভালোবাসা",
+        "desperate": "হতাশ", "hopeful": "আশা",
+    }.get(emotion, str(emotion)))
     try:
         ebbox = draw.textbbox((0, 0), emotion_emoji, font=font_ep)
         em_w = ebbox[2] - ebbox[0]
@@ -1471,7 +1568,7 @@ def draw_drama_frame(
     # ── 8. Dialogue subtitle (lower third) ──────────────────────────────────
     if dialogue:
         max_chars = 20   # shorter wrap for vertical short
-        wrapped = textwrap.wrap(dialogue.strip()[:200], width=max_chars)
+        wrapped = textwrap.wrap(bn(dialogue.strip()[:200]), width=max_chars)
         if not wrapped:
             wrapped = [dialogue.strip()[:40]]
 
@@ -1493,18 +1590,17 @@ def draw_drama_frame(
         sub_y = int(h * 0.72) - total_h // 2
         sub_y = max(bot_start + int(h * 0.02), sub_y)
 
-        # Draw a beautiful clean semi-transparent background behind text for high legibility
-        try:
-            pad_x = int(w * 0.05)
-            pad_y = int(h * 0.015)
-            max_w = max(line_widths)
-            box_x0 = (w - max_w) // 2 - pad_x
-            box_y0 = sub_y - pad_y
-            box_x1 = (w + max_w) // 2 + pad_x
-            box_y1 = sub_y + total_h + pad_y
-            draw.rectangle([box_x0, box_y0, box_x1, box_y1], fill=(0, 0, 0, 110))
-        except Exception:
-            pass
+        # কালো বাক্স/বার নেই — লেখার চারপাশে মোটা আউটলাইনই পড়ার যোগ্যতা দেয়
+        if BLACK_BARS:
+            try:
+                pad_x = int(w * 0.05)
+                pad_y = int(h * 0.015)
+                max_w = max(line_widths)
+                draw.rectangle([(w - max_w) // 2 - pad_x, sub_y - pad_y,
+                                (w + max_w) // 2 + pad_x, sub_y + total_h + pad_y],
+                               fill=(0, 0, 0, 110))
+            except Exception:
+                pass
 
         current_y = sub_y
         for i, line in enumerate(wrapped):
@@ -1722,13 +1818,13 @@ def create_drama_short_video(
         try:
             final.write_videofile(
                 output_path, fps=24, codec=codec,
-                audio_codec="aac", logger=None, threads=2, verbose=False,
+                audio_codec="aac", logger=None, threads=2,
             )
         except Exception as e:
             if codec != "libx264":
                 final.write_videofile(
                     output_path, fps=24, codec="libx264",
-                    audio_codec="aac", logger=None, threads=2, verbose=False,
+                    audio_codec="aac", logger=None, threads=2,
                 )
             else:
                 raise e
