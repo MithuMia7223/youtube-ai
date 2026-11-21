@@ -1269,6 +1269,32 @@ def ensure_cookies(path: str = "cookies.txt") -> bool:
             continue
     return False
 
+def upscale_sharpen(input_path: str) -> str:
+    """
+    উৎস ১০৮০-এর কম হলে (যেমন ৭২০p ভিডিও) ১০৮০-তে বড় করার সময় detail ফিরিয়ে আনি।
+
+    কারণ: ৭২০p → ১০৮০ মানে ১.৫× আপস্কেল — পিক্সেল নেই, তাই নরম দেখায়।
+    `cas` (Contrast Adaptive Sharpen) আপস্কেলের নরম ভাবটা অনেকটাই ফেরায়,
+    প্রান্তে হ্যালো ছাড়াই। উৎস ১০৮০+ হলে কিছুই যোগ হয় না (খরচও নেই)।
+    """
+    try:
+        import subprocess as _sp, shutil as _sh, re as _re
+        ff = _sh.which("ffmpeg") or "ffmpeg"
+        err = _sp.run([ff, "-hide_banner", "-i", input_path],
+                      capture_output=True, text=True, timeout=60).stderr
+        m = _re.search(r"Video:.*?, (\d+)x(\d+)", err)
+        if not m:
+            return ""
+        h = min(int(m.group(1)), int(m.group(2)))
+        if h >= 1080:
+            return ""
+        if os.environ.get("UPSCALE_SHARPEN", "1") == "0":
+            return ""
+        print(f"[upscale] উৎস {h}p < ১০৮০ → CAS শার্পেনিং যোগ")
+        return "cas=strength=0.55,"
+    except Exception:
+        return ""
+
 def probe_size(path):
     """(width, height) — ffprobe ছাড়াই ffmpeg stderr থেকে।"""
     import re as _re, shutil as _sh, subprocess as _sp
@@ -1411,6 +1437,8 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     _LONG = f"{_LW}:{_LH}"
 
     # উৎসে পোড়া কালো বার থাকলে আগেই কেটে নিই (নইলে স্ট্রেচে বার মোটা হয়)
+    _up_sharp = upscale_sharpen(input_path)   # ৭২০p → ১০৮০ হলে CAS যোগ
+
     bars_prefix = ""
     # নিজেরাই বানানো স্টক ভিডিও ঠিক টার্গেট সাইজে থাকে — ওতে বার থাকতেই পারে না।
     # cropdetect কালো দৃশ্যে ভুল করে "বার" ধরে ফেলে (১০৮০×১০৮০ → ১০৮০×৯০০ হয়ে যেত),
@@ -1539,7 +1567,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
             v_main = (
                 f"[{main_idx}:v]{bars_prefix}hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
-                f"unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
+                f"{_up_sharp}unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
                 f"{track_crop_chain(face_cmd_prefix, is_short=True)},{beauty_filter()}"
                 f"{title_overlay}[v_main_raw]"
             )
@@ -1547,7 +1575,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         else:
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
             parts.append(
-                f"[{main_idx}:v]{bars_prefix}hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"[{main_idx}:v]{bars_prefix}hflip,{_up_sharp}unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"setpts=PTS/{speed_factor:.4f},"
                 f"{track_crop_chain(face_cmd_prefix, is_short=False, out_w=_LW, out_h=_LH)},"
@@ -1670,14 +1698,14 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
             v_main = (
                 f"[{main_idx}:v]{bars_prefix}hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
-                f"unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
+                f"{_up_sharp}unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
                 f"{track_crop_chain(face_cmd_prefix, is_short=True)},{beauty_filter()}"
                 f"{title_overlay}"
             )
         else:
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
             v_main = (
-                f"[{main_idx}:v]{bars_prefix}hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
+                f"[{main_idx}:v]{bars_prefix}hflip,{_up_sharp}unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"setpts=PTS/{speed_factor:.4f},"
                 f"{track_crop_chain(face_cmd_prefix, is_short=False, out_w=_LW, out_h=_LH)},"
