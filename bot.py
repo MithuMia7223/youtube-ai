@@ -1595,7 +1595,6 @@ def is_youtube_url(text):
         return False
     return "youtube.com" in text or "youtu.be" in text
 
-@bot.message_handler(func=lambda message: message.text and is_youtube_url(message.text))
 def _split_and_send(chat_id: int, path: str, caption: str = "") -> bool:
     """
     বড় ভিডিও (৪৯ MB-র বেশি) কে **রিকম্প্রেস ছাড়াই** কয়েক ভাগে ভেঙে চ্যাটে পাঠাই।
@@ -1658,6 +1657,7 @@ def _split_and_send(chat_id: int, path: str, caption: str = "") -> bool:
         _sh.rmtree(tmpdir, ignore_errors=True)
 
 
+@bot.message_handler(func=lambda message: message.text and is_youtube_url(message.text))
 def handle_youtube_link(message):
     chat_id = message.chat.id
     url = message.text.strip()
