@@ -1596,6 +1596,68 @@ def is_youtube_url(text):
     return "youtube.com" in text or "youtu.be" in text
 
 @bot.message_handler(func=lambda message: message.text and is_youtube_url(message.text))
+def _split_and_send(chat_id: int, path: str, caption: str = "") -> bool:
+    """
+    বড় ভিডিও (৪৯ MB-র বেশি) কে **রিকম্প্রেস ছাড়াই** কয়েক ভাগে ভেঙে চ্যাটে পাঠাই।
+    -c copy দিয়ে কাটা হয় → ১০৮০ কোয়ালিটি অটুট, শুধু ভাগ হয়।
+    """
+    import subprocess as _sp, shutil as _sh, tempfile as _tf
+
+    def _ff() -> str:
+        for c in (_sh.which("ffmpeg"), os.path.expanduser("~/.local/bin/ffmpeg"),
+                  "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if c and os.path.exists(c):
+                return c
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return "ffmpeg"
+
+    try:
+        total_mb = os.path.getsize(path) / (1024 * 1024)
+    except Exception:
+        return False
+    limit_mb = 42.0 if not _API_BASE else 1800.0
+    if total_mb <= limit_mb:
+        return False
+    parts = int(total_mb // limit_mb) + 1
+    try:
+        # ffprobe নেই — ffmpeg -i এর stderr থেকে مدت পড়ি
+        err = _sp.run([_ff(), "-hide_banner", "-i", path],
+                      capture_output=True, text=True, timeout=60).stderr
+        m = __import__("re").search(r"Duration: (\d+):(\d+):([0-9.]+)", err)
+        dur = (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) if m else 0
+    except Exception:
+        dur = 0
+    if dur <= 0:
+        return False
+    seg = max(30.0, dur / parts)
+    tmpdir = _tf.mkdtemp(prefix="botsplit_")
+    try:
+        out_pat = os.path.join(tmpdir, "part_%02d.mp4")
+        _sp.run([_ff(), "-y", "-v", "error", "-i", path,
+                 "-c", "copy", "-map", "0", "-f", "segment",
+                 "-segment_time", f"{seg:.1f}", "-reset_timestamps", "1", out_pat],
+                check=True, timeout=3600)
+        files = sorted(f for f in os.listdir(tmpdir) if f.startswith("part_"))
+        if len(files) <= 1:
+            return False
+        bot.send_message(chat_id, f"📦 ভিডিওটা {total_mb:.0f} MB — Telegram-এর ৫০ MB সীমার জন্য "
+                                  f"{len(files)} ভাগে পাঠাচ্ছি (কোয়ালিটি অটুট, রিকম্প্রেস নেই)।")
+        for i, f in enumerate(files, 1):
+            fp = os.path.join(tmpdir, f)
+            with open(fp, "rb") as fh:
+                bot.send_document(chat_id, fh, timeout=1800,
+                                  caption=f"{caption}\n📎 ভাগ {i}/{len(files)}")
+        return True
+    except Exception as e:
+        print(f"[split_and_send] ব্যর্থ: {e}")
+        return False
+    finally:
+        _sh.rmtree(tmpdir, ignore_errors=True)
+
+
 def handle_youtube_link(message):
     chat_id = message.chat.id
     url = message.text.strip()
@@ -1982,6 +2044,15 @@ def _run_youtube_pipeline_auto(chat_id: int, url: str, is_short: bool, original_
                 sent = True
             except Exception as send_err:
                 print(f"[send_document] ব্যর্থ: {send_err}")
+        # ── ৪৯ MB-র বেশি: রিকম্প্রেস ছাড়া ভাগ করে চ্যাটেই পাঠাই ──
+        if not sent and size_mb > limit_mb:
+            if _split_and_send(chat_id, temp_processed,
+                               f"🎬 {video_title} · ১০৮০ · {size_mb:.1f} MB"):
+                sent = True
+                bot.send_message(chat_id, "✅ সব ভাগ পাঠানো হয়েছে — জোড়া লাগাতে: "
+                                          "`ffmpeg -f concat -safe 0 -i list.txt -c copy full.mp4`",
+                                 parse_mode='Markdown')
+
         # ── ২ GB পর্যন্ত: নিজের অ্যাকাউন্ট (MTProto) দিয়ে চ্যাটেই ফাইল ──
         if not sent:
             session_file = os.path.join(os.getcwd(), "tele_session.session")
