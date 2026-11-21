@@ -746,8 +746,8 @@ class OneEuroFilter:
 #             A 1:1 crop of a 16:9 source has ZERO vertical room, so the camera
 #             physically cannot follow a subject up/down. Pre-zooming buys that
 #             room back without changing the final output size.
-TRACK_ZOOM_LONG = 1.09
-TRACK_ZOOM_SHORT = 1.12
+TRACK_ZOOM_LONG = 1.02
+TRACK_ZOOM_SHORT = 1.02
 
 
 # ─── Face beautification (skin + tone) ───────────────────────────────────
@@ -996,7 +996,9 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 # but CAP the shift: an unbounded chest offset pushes the window
                 # past the top of the available crop room, which is what made
                 # the subject sit 20% off-centre in Shorts.
-                chest = min(0.8 * bh / sample_h, 0.08) if is_face else 0.0
+                # ০.০৮ (৮%) অফসেটে মুখ ফ্রেমের উপরের কিনারায় চলে যেত → কাটা পড়ত।
+                # এখন ৩%-এ সীমিত, তবু বুক/কাঁধ ফ্রেমে থাকে।
+                chest = min(0.45 * bh / sample_h, 0.03) if is_face else 0.0
                 cy = raw_c[1] + chest
                 prev_c = raw_c
                 centers.append((raw_c[0], min(cy, 1.0)))
@@ -1077,8 +1079,8 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         snap_dist = crop_w * 0.35          # bigger than this = scene cut
 
         def spring(track):
-            k, c = 6.0, 4.9                # ωn ≈ 2.45 rad/s, ζ ≈ 1.0
-            vmax = max(40.0, crop_w * 0.05) / dt
+            k, c = 9.0, 5.7                # ωn ≈ 3.0 rad/s, ζ ≈ 0.95 (দ্রুত, দোলা ছাড়া)
+            vmax = max(60.0, crop_w * 0.08) / dt
             pos, vel, out = track[0], 0.0, []
             for target in track:
                 err = target - pos
