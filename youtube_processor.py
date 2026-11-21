@@ -740,6 +740,54 @@ TRACK_ZOOM_LONG = 1.09
 TRACK_ZOOM_SHORT = 1.12
 
 
+# ─── Face beautification (skin + tone) ───────────────────────────────────
+# Tunable without touching code:
+#   FACE_BEAUTY=0            -> off
+#   FACE_BEAUTY_STRENGTH=0.5 -> half strength (subtle)
+FACE_BEAUTY = os.environ.get("FACE_BEAUTY", "1").strip().lower() not in (
+    "0", "false", "off", "no", "")
+try:
+    FACE_BEAUTY_STRENGTH = float(os.environ.get("FACE_BEAUTY_STRENGTH", "1.4"))
+except ValueError:
+    FACE_BEAUTY_STRENGTH = 1.4
+
+
+def beauty_filter(strength: float | None = None) -> str:
+    """
+    Skin softening + gentle pop for faces, tuned to read as "good camera and
+    good light" rather than an obvious filter.
+
+    smartblur : smooths low-contrast areas (skin, light shadow) while the `lt`
+                threshold protects high-contrast detail, so eyes, lips,
+                eyebrows and hair stay crisp;
+    unsharp   : puts crispness back into edges only (luma) — soft, never mushy,
+                and no colour fringing on skin;
+    eq        : small lift in brightness / contrast / saturation for a warmer,
+                healthier skin tone;
+    vibrance  : lifts muted colours (skin) more than already-saturated ones,
+                so faces warm up without turning orange.
+
+    A bilateral pass was tested and dropped: it flattens the eyes.
+    """
+    if not FACE_BEAUTY:
+        return "null"
+    v = max(0.0, min(2.0, FACE_BEAUTY_STRENGTH if strength is None else strength))
+    if v <= 0.0:
+        return "null"
+    lr = 0.9 + 0.4 * v
+    ls = -0.30 * v
+    lt = 4.0 + 2.0 * v
+    ua = 0.30 + 0.25 * v
+    bri = 0.010 * v
+    con = 1.0 + 0.025 * v
+    sat = 1.0 + 0.05 * v
+    vib = 0.10 * (v / 1.4)
+    return (f"smartblur=lr={lr:.2f}:ls={ls:.2f}:lt={lt:.1f},"
+            f"unsharp=5:5:{ua:.2f}:5:5:0.0,"
+            f"eq=brightness={bri:.3f}:contrast={con:.3f}:saturation={sat:.3f},"
+            f"vibrance=intensity={vib:.3f}")
+
+
 def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None):
     """
     ffmpeg filter chain that crops a subject-following window.
@@ -1373,7 +1421,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"split[v_sb][v_sf];"
                 f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
                 f"[v_sf]{track_crop_chain(face_cmd_prefix, is_short=True)}[v_sqs];"
-                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2"
+                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2,{beauty_filter()}"
                 f"{title_overlay}[v_main_raw]"
             )
             parts.append(v_main)
@@ -1385,7 +1433,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
                 f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
                 f"[v_split2]{track_crop_chain(face_cmd_prefix, is_short=False)}[v_fg];"
-                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,"
+                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,{beauty_filter()},"
                 f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
                 f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
                 f"{title_overlay}[v_main_raw]"
@@ -1494,7 +1542,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"split[v_sb][v_sf];"
                 f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
                 f"[v_sf]{track_crop_chain(face_cmd_prefix, is_short=True)}[v_sqs];"
-                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2"
+                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2,{beauty_filter()}"
                 f"{title_overlay}"
             )
         else:
@@ -1505,7 +1553,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
                 f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
                 f"[v_split2]{track_crop_chain(face_cmd_prefix, is_short=False)}[v_fg];"
-                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,"
+                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,{beauty_filter()},"
                 f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
                 f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
                 f"{title_overlay}"
@@ -1635,7 +1683,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"split[v_sb][v_sf];"
                 f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
                 f"[v_sf]{track_crop_chain(face_cmd_prefix, is_short=True)}[v_sqs];"
-                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2[v]"
+                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2,{beauty_filter()}[v]"
             )
         else:
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
@@ -1645,7 +1693,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
                 f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
                 f"[v_split2]{track_crop_chain(face_cmd_prefix, is_short=False)}[v_fg];"
-                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1[v]"
+                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,{beauty_filter()}[v]"
             )
 
         cmd = ["ffmpeg", "-y", "-threads", "0",
