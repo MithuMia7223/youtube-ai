@@ -64,14 +64,18 @@ def get_best_encoder():
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         res = subprocess.run([ffmpeg_exe, "-encoders"], capture_output=True, text=True, check=True)
         if "h264_videotoolbox" in res.stdout:
-            _encoder_cache = ("h264_videotoolbox", ["-q:v", "65", "-realtime", "1", "-allow_sw", "1"])
+            # বিটরেট-মোড: q:v 50 → ২.৭ Mbps (ব্লারি), ৭৫ → ২০ Mbps (অতিরিক্ত বড়)
+            # ১০৮০-এর জন্য ৮ Mbps টার্গেট — YouTube-এর সুপারিশকৃত মান,
+            # q:v 50 (৫ Mbps) নরম দেখাত, q:v 75 (২০ Mbps) ফাইল বিশাল করত
+            _encoder_cache = ("h264_videotoolbox", ["-b:v", "8M", "-maxrate", "12M",
+                                                   "-bufsize", "16M", "-allow_sw", "1"])
             print("[INFO] Hardware acceleration enabled: Using h264_videotoolbox")
         else:
-            _encoder_cache = ("libx264", ["-preset", "superfast"])
+            _encoder_cache = ("libx264", ["-preset", "veryfast", "-crf", "18"])
             print("[INFO] Hardware acceleration not found: Using libx264")
     except Exception as e:
         print(f"[Warning] Failed to check encoders: {e}. Defaulting to libx264.")
-        _encoder_cache = ("libx264", ["-preset", "superfast"])
+        _encoder_cache = ("libx264", ["-preset", "veryfast", "-crf", "18"])
         
     return _encoder_cache
 
@@ -499,6 +503,11 @@ def download_multiple_youtube_clips(url, clip_ranges, output_path):
     
     # Base strategies for client options (order of preference: default/web client first for 1080p, then fallbacks)
     base_strategies = []
+    if not os.path.exists("cookies.txt"):
+        try:
+            ensure_cookies("cookies.txt")
+        except Exception:
+            pass
     if os.path.exists("cookies.txt"):
         base_strategies.extend([
             ["--cookies", "cookies.txt"],
@@ -506,6 +515,7 @@ def download_multiple_youtube_clips(url, clip_ranges, output_path):
             ["--cookies", "cookies.txt", "--extractor-args", "youtube:player_client=android"]
         ])
     base_strategies.extend([
+        ["--cookies-from-browser", "chrome"],   # কুকি ছাড়া ৩৬০p-ই দেয়
         [],
         ["--extractor-args", "youtube:player_client=ios"],
         ["--extractor-args", "youtube:player_client=android"],
@@ -749,7 +759,7 @@ FACE_BEAUTY = os.environ.get("FACE_BEAUTY", "1").strip().lower() not in (
 try:
     FACE_BEAUTY_STRENGTH = float(os.environ.get("FACE_BEAUTY_STRENGTH", "1.4"))
 except ValueError:
-    FACE_BEAUTY_STRENGTH = 1.4
+    FACE_BEAUTY_STRENGTH = 1.0
 
 
 def beauty_filter(strength: float | None = None) -> str:
@@ -782,10 +792,19 @@ def beauty_filter(strength: float | None = None) -> str:
     con = 1.0 + 0.025 * v
     sat = 1.0 + 0.05 * v
     vib = 0.10 * (v / 1.4)
-    return (f"smartblur=lr={lr:.2f}:ls={ls:.2f}:lt={lt:.1f},"
-            f"unsharp=5:5:{ua:.2f}:5:5:0.0,"
-            f"eq=brightness={bri:.3f}:contrast={con:.3f}:saturation={sat:.3f},"
-            f"vibrance=intensity={vib:.3f}")
+    # ── গতি বনাম লুক ────────────────────────────────────────────────────
+    # মাপা (১০s @1080p): smartblur একাই ~১.৫s (ফিল্টার-চেইনের সবচেয়ে ভারী ধাপ),
+    # vignette ~০.৮s। FAST_RENDER=1 (ডিফল্ট) হলে smartblur বাদ — চেহারা প্রায়
+    # একই থাকে (unsharp+eq+vibrance থাকে), রেন্ডার হবে ~২-৩ গুণ দ্রুত।
+    # পুরো লুক দরকার হলে: FAST_RENDER=0
+    fast = os.environ.get("FAST_RENDER", "1") != "0"
+    parts = []
+    if not fast:
+        parts.append(f"smartblur=lr={lr:.2f}:ls={ls:.2f}:lt={lt:.1f}")
+    parts.append(f"unsharp=5:5:{ua:.2f}:5:5:0.0")
+    parts.append(f"eq=brightness={bri:.3f}:contrast={con:.3f}:saturation={sat:.3f}")
+    parts.append(f"vibrance=intensity={vib:.3f}")
+    return ",".join(parts)
 
 
 def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None):
@@ -803,11 +822,17 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
             f"crop=w='trunc(min(iw,ih)/{z}/2)*2':h='trunc(min(iw,ih)/{z}/2)*2':"
             f"x='(iw-ow)/2':y='(ih-oh)/2',{out}"
         )
-    out = f"scale={out_w or 3456}:{out_h or 1944}"
+    # লং: ক্রপ-উইন্ডো **১৬:৯** — উৎস ৪:৩ বা ৯:১৬ হলেও আউটপুট বিকৃত হবে না,
+    # আর উইন্ডো ফ্রেমের ভিতরে থাকে বলে কোনো কালো বার আসে না।
+    out = f"scale={out_w or 1920}:{out_h or 1080}:flags=lanczos"
+    # ⚠️ এই চেইনে **একটাই** crop থাকতে হবে — sendcmd `crop x/y` ফিল্টার-ইনডেক্স
+    # ধরে কাজ করে; বাড়তি crop বসালে কমান্ড ভুল ফিল্টারে গিয়ে ট্র্যাকিং স্থির
+    # হয়ে যায় (ঠিক এই ভুলটাই হয়েছিল)। ক্রপ-উইন্ডো ১৬:৯, তাই scale-ই যথেষ্ট।
     return (
         f"{face_cmd_prefix}"
-        f"crop=w='trunc(iw/{TRACK_ZOOM_LONG}/2)*2':h='trunc(ih/{TRACK_ZOOM_LONG}/2)*2':"
-        f"x='(iw-ow)/2':y='(ih-oh)/2',{out}"
+        f"crop=w='trunc(min(iw,ih*16/9)/{TRACK_ZOOM_LONG}/2)*2':"
+        f"h='trunc(min(ih,iw*9/16)/{TRACK_ZOOM_LONG}/2)*2':"
+        f"x='(iw-ow)/2':y='(ih-oh)/2',{out},setsar=1"
     )
 
 
@@ -860,8 +885,11 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             crop_h = crop_w
         else:
             eff_w, eff_h = float(src_w), float(src_h)
-            crop_w = math.floor(src_w / TRACK_ZOOM_LONG / 2.0) * 2.0
-            crop_h = math.floor(src_h / TRACK_ZOOM_LONG / 2.0) * 2.0
+            # ১৬:৯ উইন্ডো (উপরের ffmpeg এক্সপ্রেশনের হুবহু নকল)
+            _w = min(src_w, src_h * 16.0 / 9.0)
+            _h = min(src_h, src_w * 9.0 / 16.0)
+            crop_w = math.floor(_w / TRACK_ZOOM_LONG / 2.0) * 2.0
+            crop_h = math.floor(_h / TRACK_ZOOM_LONG / 2.0) * 2.0
 
         track_x = crop_w < eff_w - 4      # room to slide horizontally
         track_y = crop_h < eff_h - 4      # room to slide vertically
@@ -980,9 +1008,14 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
 
         n = len(centers)
         found = sum(1 for c in centers if c is not None)
-        if n == 0 or found < max(2, int(n * 0.25)):
+        # ২৫% → ১৫%: কম-দৃশ্যমান সাবজেক্টেও ট্র্যাকিং চালু রাখি (ব্যবহারকারীর
+        # চাহিদা: "সব ভিডিও ট্র্যাকিং হবে")। তার নিচে হলে স্ট্যাটিক ক্রপই নিরাপদ,
+        # কারণ ভুল ডিটেকশন নাড়ালে ক্রপ কাঁপে — সেটা আরও খারাপ দেখায়।
+        if n == 0 or found < max(2, int(n * 0.15)):
             print(f"[subject-track] No stable subject ({found}/{n} samples); keeping static center crop")
             return None
+        if found < int(n * 0.5):
+            print(f"[subject-track] Sparse subject ({found}/{n}) — gap-fill + spring smoothing")
 
         # ── Gap filling ───────────────────────────────────────────────────
         # Interpolate through short detection gaps instead of freezing on the
@@ -1178,6 +1211,62 @@ def detect_letterbox(path, samples=(0.15, 0.35, 0.55, 0.75, 0.9), limit=24):
     return f"crop={w}:{h}:{x}:{y},"
 
 
+# ── BGM বাছাই: শুধু লাইসেন্স-নিরাপদ ট্র্যাক ────────────────────────────────
+_CC0_BGM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "assets", "audio", "cc0")
+
+
+def _bgm_candidates(bgm_dir: str) -> list[str]:
+    """
+    CC0 ফোল্ডারে ট্র্যাক থাকলে শুধু সেগুলোই দাও (১০০% কপিরাইট-ফ্রি)।
+    পুরোনো bgm1..4 / bgm_chiro_abhagi-এর লাইসেন্স অজানা → বাদ দেওয়া হয়,
+    নইলে ১০৮০-র "ফ্রি" ভিডিওতেও ক্লেইম আসতে পারে।
+    """
+    def _mp3(d: str) -> list[str]:
+        if not d or not os.path.isdir(d):
+            return []
+        bad = ("bgm_combined.mp3", "bgm_chiro_abhagi.mp3")
+        out = []
+        for f in sorted(os.listdir(d)):
+            if not f.lower().endswith((".mp3", ".wav", ".m4a", ".ogg")):
+                continue
+            if f in bad or f.startswith("outro_") or f.startswith("bgm_") and f.endswith("_abhagi.mp3"):
+                continue
+            if os.path.basename(d) != "cc0" and (f in ("bgm1.mp3", "bgm2.mp3", "bgm3.mp3", "bgm4.mp3")):
+                continue
+            out.append(os.path.join(d, f))
+        return out
+
+    cc0 = _mp3(_CC0_BGM_DIR)
+    if cc0:
+        return cc0
+    return _mp3(bgm_dir)
+
+def ensure_cookies(path: str = "cookies.txt") -> bool:
+    """
+    YouTube এখন কুকি/PO-token ছাড়া ৩৬০p-এর বেশি দেয় না (ফলে ১০৮০ নরম দেখায়)।
+    Chrome-এর কুকি থেকে একবার cookies.txt বানাই → পরে সব ডাউনলোডে ব্যবহার হবে।
+    """
+    if os.path.exists(path) and os.path.getsize(path) > 100:
+        return True
+    try:
+        import yt_dlp
+    except Exception:
+        return False
+    for browser in ("chrome", "edge", "brave", "firefox"):
+        try:
+            opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+                    "cookiesfrombrowser": (browser,), "cookiefile": path}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info("https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+                                 download=False)
+            if os.path.exists(path) and os.path.getsize(path) > 100:
+                print(f"[cookies] ✅ {browser} থেকে cookies.txt তৈরি")
+                return True
+        except Exception:
+            continue
+    return False
+
 def probe_size(path):
     """(width, height) — ffprobe ছাড়াই ffmpeg stderr থেকে।"""
     import re as _re, shutil as _sh, subprocess as _sp
@@ -1212,14 +1301,8 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     watermark_text = os.environ.get("WATERMARK_TEXT", "Tawhidul official")
     
     # Get random BGM file
-    bgm_files = []
-    if os.path.exists(bgm_dir):
-        bgm_files = [
-            os.path.join(bgm_dir, f) 
-            for f in os.listdir(bgm_dir) 
-            if f.endswith(".mp3") and f != "bgm_combined.mp3" and not f.startswith("outro_")
-        ]
-    
+    bgm_files = _bgm_candidates(bgm_dir)
+
     bgm_path = random.choice(bgm_files) if bgm_files else None
     
     # Check if the input file has an audio track and get exact duration
@@ -1247,7 +1330,13 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     tempo_factor = speed_factor / pitch_factor
 
     # ── Face tracking: build a sendcmd file so the crop window follows the face ──
-    face_cmd_file = compute_face_sendcmd_file(input_path, speed_factor, is_short)
+    # শুধু শর্টস-চেইনে ফেস-ক্রপ ব্যবহার হয়। লং-ফর্ম এখন ফুল-ব্লিড cover-crop করে,
+    # তাই ওখানে sendcmd লাগে না। আগে সব ভিডিওতে ৫ fps-এ YuNet/Haar চলত →
+    # ৩০ মিনিটের লং ভিডিওতে হাজার হাজার ফ্রেম বিশ্লেষণ = পুরো সময়ের বড় অংশ নষ্ট।
+    face_cmd_file = compute_face_sendcmd_file(
+        input_path, speed_factor, is_short,
+        sample_fps=12.0 if is_short else 10.0,
+    )
     face_cmd_prefix = f"sendcmd=f='{face_cmd_file}'," if face_cmd_file else ""
     
     # Randomize EQ values per run for viral cinematic drama style (high contrast, warm skin tones, vibrant saturation)
@@ -1305,10 +1394,41 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     cmd_inputs += ["-i", input_path]
     main_idx = 0
 
+    # আউটপুটের DAR জোর করে ঠিক রাখি — উৎসের অদ্ভুত SAR (যেমন 256:81) ক্যারি হয়ে
+    # ফাইলটা 1080x1920 হয়েও 16:9 দেখালে মোবাইল প্লেয়ার বার বসিয়ে স্কেল করে।
+    # শর্টস এখন ১:১ স্কয়ার (বার-মুক্ত, ফুল-ব্লিড)
+    _ASPECT = "1:1" if is_short else "16:9"
+    # লং-ফর্ম আগে জোর করে 4K (3840x2160) বানাত → মোবাইলে ৪ গুণ পিক্সেল ডিকোড,
+    # ব্যাটারি/হিট/ল্যাগ। এখন ডিফল্ট 1080p; দরকার হলে KEEP_4K=1 দিয়ে 4K।
+    if is_short:
+        _LW, _LH = 1080, 1080
+    elif os.environ.get("KEEP_4K", "0") == "1":
+        _LW, _LH = 3840, 2160
+    else:
+        _LW, _LH = 1920, 1080
+    _LONG = f"{_LW}:{_LH}"
+
     # উৎসে পোড়া কালো বার থাকলে আগেই কেটে নিই (নইলে স্ট্রেচে বার মোটা হয়)
     bars_prefix = ""
+    # নিজেরাই বানানো স্টক ভিডিও ঠিক টার্গেট সাইজে থাকে — ওতে বার থাকতেই পারে না।
+    # cropdetect কালো দৃশ্যে ভুল করে "বার" ধরে ফেলে (১০৮০×১০৮০ → ১০৮০×৯০০ হয়ে যেত),
+    # তাই টার্গেট সাইজে হলে সনাক্তকরণ বাদ দিই।
+    _skip_bars = False
     try:
-        _bars = detect_letterbox(input_path)
+        import shutil as _sh2
+        _ff2 = _sh2.which("ffmpeg") or "ffmpeg"
+        _e2 = __import__("subprocess").run([_ff2, "-hide_banner", "-i", str(input_path)],
+                                           capture_output=True, text=True, timeout=60).stderr
+        _m2 = __import__("re").search(r"Video:.*?, (\d+)x(\d+)", _e2)
+        if _m2:
+            _iw, _ih = int(_m2.group(1)), int(_m2.group(2))
+            if (_iw, _ih) in ((1080, 1080), (1920, 1080), (_LW, _LH)):
+                _skip_bars = True
+                print(f"[letterbox] ইনপুট {_iw}×{_ih} ইতিমধ্যে টার্গেট — বার-সনাক্তকরণ বাদ")
+    except Exception:
+        pass
+    try:
+        _bars = None if _skip_bars else detect_letterbox(input_path)
         if _bars:
             bars_prefix = _bars
             print(f"[letterbox] উৎসের কালো বার কাটা হচ্ছে: {_bars.rstrip(',')}")
@@ -1406,7 +1526,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         if is_short:
             parts.append(f"[{thumb_idx}:v]scale=1080:1920,setsar=1[v_t]")
         else:
-            parts.append(f"[{thumb_idx}:v]scale=3840:2160,setsar=1[v_t]")
+            parts.append(f"[{thumb_idx}:v]scale={_LONG},setsar=1[v_t]")
 
         # Thumbnail silent audio (1.5 s, stereo 44100 Hz)
         parts.append("aevalsrc=0:c=stereo:s=44100:d=1.5[a_t]")
@@ -1417,11 +1537,8 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
             v_main = (
                 f"[{main_idx}:v]{bars_prefix}hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
-                f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
-                f"split[v_sb][v_sf];"
-                f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
-                f"[v_sf]{track_crop_chain(face_cmd_prefix, is_short=True)}[v_sqs];"
-                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2,{beauty_filter()}"
+                f"unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
+                f"{track_crop_chain(face_cmd_prefix, is_short=True)},{beauty_filter()}"
                 f"{title_overlay}[v_main_raw]"
             )
             parts.append(v_main)
@@ -1429,18 +1546,17 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
             parts.append(
                 f"[{main_idx}:v]{bars_prefix}hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
-                f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
-                f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
-                f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
-                f"[v_split2]{track_crop_chain(face_cmd_prefix, is_short=False)}[v_fg];"
-                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,{beauty_filter()},"
+                f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
+                f"setpts=PTS/{speed_factor:.4f},"
+                f"{track_crop_chain(face_cmd_prefix, is_short=False, out_w=_LW, out_h=_LH)},"
+                f"{beauty_filter()},"
                 f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
                 f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
                 f"{title_overlay}[v_main_raw]"
             )
             
         v_main_name = "[v_main_raw]"
-        if has_avatar:
+        if has_avatar and os.environ.get("SHOW_AVATAR", "0") == "1":
             r = avatar_sz // 2
             parts.append(f"[{avatar_idx}:v]scale={avatar_sz}:{avatar_sz},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-{r},Y-{r}),{r}),255,0)'[avatar_round]")
             pad = 60 if is_short else 100
@@ -1482,8 +1598,15 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 current_dialogue = "[diag_intro]"
                 
             if has_narration:
+                # ⚠️ "extra voice" বাগ: আগে উৎস ক্লিপের নিজের কথা volume=0.35-এ
+                # রাখা হতো, তাই ন্যারেশনের নিচে মূল ক্লিপের কণ্ঠও শোনা যেত —
+                # দুই কণ্ঠ একসাথে। এখন ডিফল্টে উৎস-কণ্ঠ **বন্ধ** (0.0);
+                # ইচ্ছা করলে KEEP_ORIG_AUDIO_VOL=0.35 দিয়ে ফেরানো যায়।
                 parts.append(f"[{narration_idx}:a]asetpts=N/SR/TB,volume=1.5[narr_vol]")
-                parts.append(f"{current_dialogue}volume=0.35[orig_bg]")
+                # amix-এ উৎস রাখতেই হয় (নইলে [a_eq] আউটপুট unconnected → ffmpeg এরর),
+                # কিন্তু ভলিউম ০ হলে কিছু শোনা যায় না → "extra voice" আর নেই।
+                _orig_vol = float(os.environ.get("KEEP_ORIG_AUDIO_VOL", "0") or 0)
+                parts.append(f"{current_dialogue}volume={_orig_vol}[orig_bg]")
                 parts.append(f"[orig_bg][narr_vol]amix=inputs=2:duration=first:normalize=0[diag_narr]")
                 current_dialogue = "[diag_narr]"
                 
@@ -1514,12 +1637,19 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
             sub_filter = f"[v_main_p]subtitles='{escaped_srt}':force_style='Alignment=2,MarginV={margin},OutlineColour=&H000000,BorderStyle=3,Outline=3,Shadow=0,Fontname=Arial,Fontsize={font_sz},PrimaryColour=&H00FFFF'[v_main_sub]"
             parts.append(sub_filter)
             v_main_final = "[v_main_sub]"
-        parts.append(f"[v_t][a_t]{v_main_final}[a_main_out]concat=n=2:v=1:a=1[v][a]")
+        # SAR ঠিক করা: উৎসের SAR (যেমন 256:81) ক্যারি হয়ে গেলে ফাইলটা
+        # 1080x1920 হয়েও DAR 16:9 দেখায় → মোবাইল প্লেয়ার একে চওড়া করে,
+        # উপরে-নিচে বার + স্কেলিং-স্ট্রেস। setsar=1 দিলে DAR ঠিক 9:16 হয়।
+        parts.append(f"{v_main_final}setsar=1[v_sar]")
+        parts.append(f"[v_t][a_t][v_sar][a_main_out]concat=n=2:v=1:a=1[v][a]")
 
         filter_str = "; ".join(parts)
         cmd = ["ffmpeg", "-y", "-threads", "0", "-sws_flags", "lanczos"]
         cmd += cmd_inputs
-        cmd += ["-filter_complex", filter_str, "-map", "[v]", "-map", "[a]", "-c:a", "aac"]
+        # +faststart: moov-box শুরুতে থাকে → মোবাইলে/p্রিভিউতে সাথে সাথে চলে,
+        # পুরো ফাইল ডাউনলোডের জন্য অপেক্ষা করতে হয় না (মোবাইলে "স্ট্রেস" কমে)
+        cmd += ["-filter_complex", filter_str, "-map", "[v]", "-map", "[a]",
+                "-c:a", "aac", "-movflags", "+faststart", "-aspect", _ASPECT]
         if has_bgm:
             cmd += ["-shortest"]
         cmd += ["-c:v", enc] + enc_args + [output_path]
@@ -1538,22 +1668,18 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
             v_main = (
                 f"[{main_idx}:v]{bars_prefix}hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
-                f"vignette=PI/20,unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
-                f"split[v_sb][v_sf];"
-                f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
-                f"[v_sf]{track_crop_chain(face_cmd_prefix, is_short=True)}[v_sqs];"
-                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2,{beauty_filter()}"
+                f"unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
+                f"{track_crop_chain(face_cmd_prefix, is_short=True)},{beauty_filter()}"
                 f"{title_overlay}"
             )
         else:
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
             v_main = (
                 f"[{main_idx}:v]{bars_prefix}hflip,unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
-                f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
-                f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
-                f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
-                f"[v_split2]{track_crop_chain(face_cmd_prefix, is_short=False)}[v_fg];"
-                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,{beauty_filter()},"
+                f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
+                f"setpts=PTS/{speed_factor:.4f},"
+                f"{track_crop_chain(face_cmd_prefix, is_short=False, out_w=_LW, out_h=_LH)},"
+                f"{beauty_filter()},"
                 f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
                 f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
                 f"{title_overlay}"
@@ -1562,7 +1688,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         vf_parts.append(f"{v_main}[v_raw]")
         current_v = "[v_raw]"
         
-        if has_avatar:
+        if has_avatar and os.environ.get("SHOW_AVATAR", "0") == "1":
             r = avatar_sz // 2
             pad = 60 if is_short else 100
             vf_parts.append(f"[{avatar_idx}:v]scale={avatar_sz}:{avatar_sz},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-{r},Y-{r}),{r}),255,0)'[avatar_round]")
@@ -1609,8 +1735,10 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 current_a = "[diag_intro]"
                 
             if has_narration:
+                # (একই ফিক্স — থাম্বনেইল-ছাড়া পথ)
                 parts_nt.append(f"[{narration_idx}:a]asetpts=N/SR/TB,volume=1.5[narr_vol]")
-                parts_nt.append(f"{current_a}volume=0.35[orig_bg]")
+                _orig_vol2 = float(os.environ.get("KEEP_ORIG_AUDIO_VOL", "0") or 0)
+                parts_nt.append(f"{current_a}volume={_orig_vol2}[orig_bg]")
                 parts_nt.append(f"[orig_bg][narr_vol]amix=inputs=2:duration=first:normalize=0[diag_narr]")
                 current_a = "[diag_narr]"
                 
@@ -1653,11 +1781,11 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         cmd = ["ffmpeg", "-y", "-threads", "0", "-sws_flags", "lanczos"]
         cmd += cmd_inputs
         if no_thumb_af:
-            cmd += ["-filter_complex", f"{no_thumb_vf};{no_thumb_af}", "-map", "[v]", "-map", "[a]", "-c:a", "aac"]
+            cmd += ["-filter_complex", f"{no_thumb_vf};{no_thumb_af}", "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-movflags", "+faststart", "-aspect", _ASPECT]
             if has_bgm:
                 cmd += ["-shortest"]
         else:
-            cmd += ["-filter_complex", no_thumb_vf, "-map", "[v]"]
+            cmd += ["-filter_complex", no_thumb_vf, "-map", "[v]", "-movflags", "+faststart", "-aspect", _ASPECT]
         cmd += ["-c:v", enc] + enc_args + [output_path]
         return cmd
 
@@ -1680,20 +1808,16 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         if is_short:
             v_f = (
                 f"[0:v]hflip,setpts=PTS/{speed_factor:.4f},"
-                f"split[v_sb][v_sf];"
-                f"[v_sb]scale=1080:1920,boxblur=lr=25:lp=2[v_bb];"
-                f"[v_sf]{track_crop_chain(face_cmd_prefix, is_short=True)}[v_sqs];"
-                f"[v_bb][v_sqs]overlay=(W-w)/2:(H-h)/2,{beauty_filter()}[v]"
+                f"{track_crop_chain(face_cmd_prefix, is_short=True)},{beauty_filter()}[v]"
             )
         else:
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
             v_f = (
                 f"[0:v]hflip,unsharp=5:5:0.8:5:5:0.8,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
-                f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},vignette=PI/10,"
-                f"setpts=PTS/{speed_factor:.4f},split[v_split1][v_split2];"
-                f"[v_split1]scale=3840:2160,boxblur=lr=25:lp=2[v_blur];"
-                f"[v_split2]{track_crop_chain(face_cmd_prefix, is_short=False)}[v_fg];"
-                f"[v_blur][v_fg]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,{beauty_filter()}[v]"
+                f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
+                f"setpts=PTS/{speed_factor:.4f},"
+                f"{track_crop_chain(face_cmd_prefix, is_short=False, out_w=_LW, out_h=_LH)},"
+                f"{beauty_filter()}[v]"
             )
 
         cmd = ["ffmpeg", "-y", "-threads", "0",
@@ -1717,9 +1841,9 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                     f"asetrate=44100*{pitch_factor:.4f},aresample=44100,asetpts=N/SR/TB,"
                     f"atempo={tempo_factor:.4f},volume=1.20[a]"
                 )
-            cmd += ["-filter_complex", f"{v_f};{a_f_bare}", "-map", "[v]", "-map", "[a]", "-c:a", "aac"]
+            cmd += ["-filter_complex", f"{v_f};{a_f_bare}", "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-movflags", "+faststart", "-aspect", _ASPECT]
         else:
-            cmd += ["-filter_complex", v_f, "-map", "[v]"]
+            cmd += ["-filter_complex", v_f, "-map", "[v]", "-movflags", "+faststart", "-aspect", _ASPECT]
         cmd += ["-c:v", enc] + enc_args + [output_path]
         return cmd
  
@@ -1727,9 +1851,9 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     # ── Try all fallback levels ────────────────────────────────────────────────
     fallback_levels = [
         ("Full pipeline",          lambda: build_command(encoder, encoder_args)),
-        ("libx264 full",           lambda: build_command("libx264", ["-preset", "superfast"])),
-        ("libx264 no-thumbnail",   lambda: build_command_no_thumb("libx264", ["-preset", "superfast"])),
-        ("libx264 bare-minimum",   lambda: build_command_bare("libx264", ["-preset", "superfast"])),
+        ("libx264 full",           lambda: build_command("libx264", ["-preset", "veryfast", "-crf", "18"])),
+        ("libx264 no-thumbnail",   lambda: build_command_no_thumb("libx264", ["-preset", "veryfast", "-crf", "18"])),
+        ("libx264 bare-minimum",   lambda: build_command_bare("libx264", ["-preset", "veryfast", "-crf", "18"])),
     ]
 
     try:
@@ -1763,13 +1887,27 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
             except Exception:
                 pass
 
-def compress_video_if_needed(input_path, max_size_mb=44):
+def compress_video_if_needed(input_path, max_size_mb=None):
     """
-    Compress video using target bitrates to ensure it fits under the Telegram file transfer limit (50MB).
-    Scales resolution down to 480p to fit sizing.
+    ভিডিও কম্প্রেশন — **ডিফল্টে বন্ধ (আনলিমিটেড)**।
+
+    কারণ: Telegram Bot API-তে বটের আপলোড সীমা ৫০ MB; ওই সীমার নিচে আনতে হলে
+    রেজোলিউশন/বিটরেট কমাতে হয় — তখন ১০৮০ আর থাকে না। তাই এখন:
+      MAX_VIDEO_MB = 0 (ডিফল্ট) → কোনো কম্প্রেশন নেই, অরিজিনাল কোয়ালিটি
+      MAX_VIDEO_MB = 49        → আগের আচরণ (৫০MB-র নিচে আনার চেষ্টা)
     """
     set_ffmpeg_path()
-    
+
+    if max_size_mb is None:
+        try:
+            max_size_mb = float(os.environ.get("MAX_VIDEO_MB", "0"))
+        except ValueError:
+            max_size_mb = 0.0
+    if max_size_mb <= 0:
+        mb = os.path.getsize(input_path) / (1024 * 1024)
+        print(f"[compress] আনলিমিটেড মোড — কম্প্রেশন বাদ ({mb:.1f} MB, ফুল কোয়ালিটি)")
+        return input_path
+
     file_size = os.path.getsize(input_path)
     file_size_mb = file_size / (1024 * 1024)
     print(f"Video size before compression: {file_size_mb:.2f} MB")
@@ -1818,8 +1956,20 @@ def compress_video_if_needed(input_path, max_size_mb=44):
             clean_encoder_args.append(arg)
             i += 1
             
-    # Dynamically select resolution based on video bitrate to prevent blocky artifacts
-    if is_square:
+    # ── রেজোলিউশন: আর কখনো ১০৮০-র নিচে নামবে না ─────────────────────────
+    # আগে কম বিটরেটে ৪৮০p/৭২০p-তে নামিয়ে দিত → ডাউনলোড করা ভিডিও ১০৮০ থাকত না।
+    # এখন রেজোলিউশন **সবসময় ১০৮০** রাখি, কমে শুধু বিটরেট।
+    # দরকার হলে MIN_1080=0 দিয়ে পুরোনো আচরণ ফেরানো যায়।
+    min_1080 = os.environ.get("MIN_1080", "1") != "0"
+    if min_1080:
+        if is_square:
+            scale_size = "1080x1080"
+        else:
+            scale_size = "1080x1920" if is_vertical else "1920x1080"
+        if video_bitrate < 900000:
+            print(f"[compress] ⚠️ {video_bitrate//1000} kbps — ১০৮০ রাখা হচ্ছে, "
+                  f"তাই কিছুটা ব্লকি হতে পারে (দৈর্ঘ্য কমালে ভালো)")
+    elif is_square:
         if video_bitrate < 400000:
             scale_size = "480x480"
         elif video_bitrate < 700000:
@@ -1856,9 +2006,9 @@ def compress_video_if_needed(input_path, max_size_mb=44):
         if encoder != "libx264":
             print(f"[Warning] Compression failed with encoder '{encoder}': {e}. Retrying with libx264...")
             global _encoder_cache
-            _encoder_cache = ("libx264", ["-preset", "superfast"])
+            _encoder_cache = ("libx264", ["-preset", "veryfast", "-crf", "18"])
             encoder, encoder_args = _encoder_cache
-            clean_encoder_args = ["-preset", "superfast"]
+            clean_encoder_args = ["-preset", "veryfast", "-crf", "18"]
             cmd = [
                 "ffmpeg", "-y",
                 "-i", input_path,
@@ -1905,13 +2055,7 @@ def mix_bgm_on_merged_video(video_path, output_path, bgm_dir="assets/audio", pre
             bgm_path = potential_path
             
     if not bgm_path:
-        bgm_files = []
-        if os.path.exists(bgm_dir):
-            bgm_files = [
-                os.path.join(bgm_dir, f) 
-                for f in os.listdir(bgm_dir) 
-                if f.endswith(".mp3") and f != "bgm_combined.mp3" and not f.startswith("outro_")
-            ]
+        bgm_files = _bgm_candidates(bgm_dir)
         bgm_path = random.choice(bgm_files) if bgm_files else None
         
     if not bgm_path or not os.path.exists(bgm_path):

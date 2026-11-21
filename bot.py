@@ -1,4 +1,5 @@
 import os
+import shutil
 import time
 import threading
 from datetime import datetime
@@ -22,6 +23,31 @@ from affiliate_helper import get_affiliate_text, save_link, load_links
 
 load_dotenv()
 
+# ── একটাই ইনস্ট্যান্স (ডাবল-বট আটকানো) ────────────────────────────────────
+# আগে দুইটা বট একসাথে চলত → দুটোই Telegram-এ সাড়া দিত, একটা পুরোনো কোডে
+# কম-কোয়ালিটি ভিডিও পাঠিয়ে দিত। flock দিয়ে দ্বিতীয়টা সাথে সাথে বন্ধ হয়ে যাবে।
+_LOCK_FH = None
+
+
+def _single_instance_or_die():
+    global _LOCK_FH
+    import fcntl
+    import sys as _sys
+
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.lock")
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[bot] ⚠️ আরেকটা ইনস্ট্যান্স ইতিমধ্যেই চলছে — এই প্রসেস বন্ধ হচ্ছে।")
+        _sys.exit(0)
+    fh.write(str(os.getpid()))
+    fh.flush()
+    _LOCK_FH = fh          # রেফারেন্স ধরে রাখি, নইলে GC-তে লক ছুটে যায়
+
+
+_single_instance_or_die()
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     print("[ERROR] TELEGRAM_BOT_TOKEN is not set in the .env file!")
@@ -29,8 +55,93 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# ── আনলিমিটেড আপলোড: লোকাল Telegram Bot API সার্ভার ───────────────────────
+# স্ট্যান্ডার্ড Bot API-তে বট ৫০ MB-র বেশি পাঠাতে পারে না (ভিডিও বা ফাইল, দুটোতেই)।
+# নিজের telegram-bot-api সার্ভার চালালে সীমা ২০০০ MB — তখন:
+#     TELEGRAM_API_URL=http://127.0.0.1:8081 python bot.py
+_API_BASE = os.getenv("TELEGRAM_API_URL", "").strip()
+if _API_BASE:
+    telebot.apihelper.API_URL = _API_BASE.rstrip("/") + "/bot{0}/{1}"
+    print(f"[upload] লোকাল Bot API সার্ভার ব্যবহার হচ্ছে → {_API_BASE} (সীমা ~২ GB)")
+else:
+    print("[upload] স্ট্যান্ডার্ড Bot API — বটের সীমা ৫০ MB (আনলিমিটেড নয়)")
+
 # ── User session store ────────────────────────────────────────────────────────
 user_sessions = {}
+
+
+# ── ফুল-কোয়ালিটি ডাউনলোড সার্ভার (টেলিগ্রামের ৫০ MB সীমা bypass) ──────────
+_DL_SERVER = {"started": False, "port": None}
+
+
+def _lan_ip():
+    """একই Wi-Fi-তে ফোন থেকে 접근할 লোকাল IP।"""
+    import socket as _s
+    try:
+        sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        sock.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+# ── 🌐 ভিডিও ভল্ট (web/app.py) লিংক ─────────────────────────────────────────
+VAULT_PORT = int(os.environ.get("VAULT_PORT", "8770"))
+
+
+def ensure_vault_server():
+    """ওয়েবসাইটটা না চললে বট নিজেই চালু করে দেয় (daemon প্রসেস)।"""
+    import socket as _sock
+    try:
+        with _sock.create_connection(("127.0.0.1", VAULT_PORT), timeout=1):
+            return VAULT_PORT
+    except OSError:
+        pass
+    try:
+        subprocess.Popen(
+            [os.path.join(".venv", "bin", "python"), "web/app.py"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(1.5)
+    except Exception as e:
+        print(f"[vault] সার্ভার চালু করা যায়নি: {e}")
+    return VAULT_PORT
+
+
+def vault_link(filename: str | None = None) -> str:
+    """সাইটের (বা নির্দিষ্ট ফাইলের ডাউনলোড) লিংক।"""
+    port = ensure_vault_server()
+    base = f"http://{_lan_ip()}:{port}"
+    if filename:
+        from urllib.parse import quote as _q
+        return f"{base}/download/{_q(filename)}"
+    return base + "/"
+
+
+def ensure_download_server(directory, port=8099):
+    """
+    `directory`-কে HTTP-তে সার্ভ করে (ডেমন থ্রেড)। ফোন/ব্রাউজার থেকে
+    ফুল-কোয়ালিটি ভিডিও ডাউনলোড করা যাবে — ৫০ MB সীমা নেই।
+    """
+    if _DL_SERVER["started"]:
+        return _DL_SERVER["port"]
+    import functools
+    import threading
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+    handler = functools.partial(SimpleHTTPRequestHandler, directory=directory)
+    try:
+        httpd = ThreadingHTTPServer(("0.0.0.0", port), handler)
+    except OSError:
+        httpd = ThreadingHTTPServer(("0.0.0.0", 0), handler)  # পোর্ট ব্যস্ত হলে যেকোনোটা
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    _DL_SERVER["started"] = True
+    _DL_SERVER["port"] = httpd.server_address[1]
+    print(f"[download-server] http://{_lan_ip()}:{_DL_SERVER['port']}/ → {directory}")
+    return _DL_SERVER["port"]
 
 
 def get_session(chat_id: int) -> dict:
@@ -963,6 +1074,20 @@ def _generate_and_send_story(chat_id: int, topic: str):
     )
 
 
+@bot.message_handler(commands=['site', 'vault', 'link'])
+def cmd_site(message):
+    """🌐 ভিডিও ভল্ট সাইটের লিংক।"""
+    try:
+        bot.send_message(
+            message.chat.id,
+            f"🌐 **ভিডিও ভল্ট** — সব ভিডিও, ১০৮০, কম্প্রেশন ছাড়া:\n`{vault_link()}`\n\n"
+            f"📱 ফোন আর ম্যাক একই Wi-Fi-তে থাকতে হবে।",
+            parse_mode='Markdown',
+        )
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ {e}")
+
+
 @bot.message_handler(commands=['video'])
 def handle_video(message):
     chat_id = message.chat.id
@@ -1474,7 +1599,23 @@ def is_youtube_url(text):
 def handle_youtube_link(message):
     chat_id = message.chat.id
     url = message.text.strip()
-    
+
+    # ── শুধু ওয়েবসাইট (ডিফল্ট) ──────────────────────────────────────────
+    # বট আর নিজে প্রসেস করে না; সাইটে লিংক দিলে ডাউনলোড+১:১+১০৮০ সব সাইট করে।
+    # পুরোনো আচরণ ফেরাতে: WEB_ONLY=0
+    if os.environ.get("WEB_ONLY", "1") == "1":
+        from urllib.parse import quote as _q
+        pre = f"{vault_link()}?url={_q(url, safe='')}&mode=square"
+        bot.send_message(
+            chat_id,
+            "🌐 *ওয়েবসাইটে খুলে ফেলো* — ডাউনলোড, ১:১ ক্রপ, ১০৮০ HD সব ওখানেই হবে।\n\n"
+            f"👉 [এकানে চাপো (লিংক আগেই বসানো)]({pre})\n\n"
+            f"সাইট: `{vault_link()}`",
+            parse_mode='Markdown',
+            disable_web_page_preview=True,
+        )
+        return
+
     markup = InlineKeyboardMarkup()
     markup.add(
         InlineKeyboardButton("📱 Shorts ক্লিপ (৩০-৯০ সে.)", callback_data=f"yt_short_{url}"),
@@ -1812,11 +1953,91 @@ def _run_youtube_pipeline_auto(chat_id: int, url: str, is_short: bool, original_
             with open(thumb_path, 'rb') as t_file:
                 bot.send_photo(chat_id, t_file, caption="🎨 আপনার কাস্টম এআই থাম্বনেইল")
                 
+        # ── সবসময় ফুল-কোয়ালিটি কপি রাখি → ওয়েবসাইট (web/app.py) থেকে ডাউনলোড হবে ──
+        try:
+            deliver_dir = os.path.join(os.getcwd(), "deliver")
+            os.makedirs(deliver_dir, exist_ok=True)
+            shutil.copy2(temp_processed, os.path.join(deliver_dir, os.path.basename(temp_processed)))
+        except Exception as _cp_err:
+            print(f"[deliver] কপি ব্যর্থ: {_cp_err}")
+
         # Send Final processed Video File directly to the user
-        bot.send_message(chat_id, "📥 ভিডিও ফাইলটি চ্যাটে আপলোড হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...")
-        with open(temp_processed, 'rb') as v_file:
-            bot.send_video(chat_id, v_file, caption=f"🎬 {video_title}", timeout=600)
+        # ⚠️ Telegram Bot API-তে বটের আপলোড সীমা ৫০ MB। তার বেশি হলে send_video
+        # ব্যর্থ হয় — তখন ফাইলটা ডিস্কে রেখে ডাউনলোড-পাথ/লিংক পাঠাই,
+        # যাতে ফুল-কোয়ালিটি (১০৮০) ভিডিও হাতের কাছে থাকে।
+        size_mb = os.path.getsize(temp_processed) / (1024 * 1024)
+        bot.send_message(chat_id, f"📥 ভিডিও ফাইলটি পাঠানো হচ্ছে ({size_mb:.1f} MB)...")
+        sent = False
+        limit_mb = 1900 if _API_BASE else 49
+        if size_mb <= limit_mb:
+            try:
+                # ভিডিও হিসেবে নয় — **ফাইল (ডকুমেন্ট)** হিসেবে পাঠাই,
+                # যাতে টেলিগ্রাম নিজে থেকে রিকম্প্রেস না করে (কোয়ালিটি অটুট)
+                with open(temp_processed, 'rb') as v_file:
+                    bot.send_document(
+                        chat_id, v_file,
+                        caption=f"🎬 {video_title} · {size_mb:.1f} MB · ১০৮০",
+                        timeout=1800,
+                    )
+                sent = True
+            except Exception as send_err:
+                print(f"[send_document] ব্যর্থ: {send_err}")
+        # ── ২ GB পর্যন্ত: নিজের অ্যাকাউন্ট (MTProto) দিয়ে চ্যাটেই ফাইল ──
+        if not sent:
+            session_file = os.path.join(os.getcwd(), "tele_session.session")
+            if os.environ.get("TELEGRAM_API_ID") and os.path.exists(session_file):
+                try:
+                    import subprocess as _sp
+                    bot.send_message(chat_id, "📤 ফাইলটা বড় — তোমার অ্যাকাউন্ট দিয়ে চ্যাটে পাঠাচ্ছি (২ GB পর্যন্ত চলে)...")
+                    r = _sp.run(
+                        [os.path.join(".venv", "bin", "python"), "tools/tele_upload.py",
+                         str(chat_id), temp_processed, f"🎬 {video_title} · {size_mb:.1f} MB · ১০৮০"],
+                        capture_output=True, text=True, timeout=3600,
+                    )
+                    if r.returncode == 0:
+                        sent = True
+                        bot.send_message(chat_id, f"✅ চ্যাটে পাঠানো হয়েছে ({size_mb:.1f} MB) — ১০৮০ অটুট")
+                    else:
+                        print(f"[tele_upload] ব্যর্থ: {r.stdout[-400:]} {r.stderr[-400:]}")
+                except Exception as up_err:
+                    print(f"[tele_upload] ত্রুটি: {up_err}")
+
+        if not sent:
+            deliver_dir = os.path.join(os.getcwd(), "deliver")
+            os.makedirs(deliver_dir, exist_ok=True)
+            keep = os.path.join(deliver_dir, os.path.basename(temp_processed))
+            try:
+                shutil.copy2(temp_processed, keep)
+            except Exception:
+                keep = temp_processed
+            # ফোন থেকে সরাসরি ডাউনলোডের লিংক (একই Wi-Fi)
+            link_line = ""
+            try:
+                port = ensure_download_server(deliver_dir)
+                link_line = (f"\n\n📲 **ফোনে ডাউনলোড লিংক** (একই Wi-Fi-তে):\n"
+                             f"`http://{_lan_ip()}:{port}/{os.path.basename(keep)}`")
+            except Exception as dl_err:
+                print(f"[download-server] শুরু করা যায়নি: {dl_err}")
+            bot.send_message(
+                chat_id,
+                f"📁 **ফুল-কোয়ালিটি ভিডিও (১০৮০)** — টেলিগ্রামের ৫০ MB সীমার চেয়ে বড়, "
+                f"তাই কম্প্রেস না করে রাখা হলো:\n\n`{keep}`\n"
+                f"সাইজ: {size_mb:.1f} MB · রিজোলিউশন ১০৮০ অটুট{link_line}",
+                parse_mode='Markdown',
+            )
             
+        # 🌐 সাইটের লিংক — চাইলে ফুল-কোয়ালিটিতে ডাউনলোড করবে
+        try:
+            _fname = os.path.basename(temp_processed)
+            bot.send_message(
+                chat_id,
+                f"🌐 **ভিডিও ভল্ট** (সব ভিডিও, ১০৮০):\n`{vault_link()}`\n\n"
+                f"⬇️ এই ভিডিওর সরাসরি ডাউনলোড:\n`{vault_link(_fname)}`",
+                parse_mode='Markdown',
+            )
+        except Exception as _vl:
+            print(f"[vault] লিংক পাঠানো যায়নি: {_vl}")
+
         for path in temp_files:
             if os.path.exists(path):
                 try:
