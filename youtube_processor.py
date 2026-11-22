@@ -1345,6 +1345,9 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     # VOICE_ORIGINAL=1 (ডিফল্ট): শিল্পীর নিজের কণ্ঠ অটুট — পিচ বদলাবে না (AI ভয়েস নয়)
     sq = bool(is_short) or os.environ.get("FORCE_SQUARE", "1") != "0"
     voice_original = os.environ.get("VOICE_ORIGINAL", "1") != "0"
+    # MUTE_DIALOGUE=1 → ভিডিওর কণ্ঠ/ডায়ালগ বাদ, শুধু BGM থাকবে
+    mute_dialogue = os.environ.get("MUTE_DIALOGUE", "0") == "1"
+    _dial_vol = "0" if mute_dialogue else "1.35"
 
     f_bangla = get_best_font_path("bangla")
     f_english = get_best_font_path("english")
@@ -1637,7 +1640,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
                 f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
                 f"{_pitch_part}asetpts=N/SR/TB,"
-                f"atempo={tempo_factor:.4f},volume=1.35"
+                f"atempo={tempo_factor:.4f},volume={_dial_vol}"
             )
             bgm_vol_val = 0.28
         else:
@@ -1649,7 +1652,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
                 f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
                 f"{_pitch_part}asetpts=N/SR/TB,"
-                f"atempo={tempo_factor:.4f},volume=1.35"
+                f"atempo={tempo_factor:.4f},volume={_dial_vol}"
             )
             bgm_vol_val = 0.28
         if has_audio:
@@ -1776,7 +1779,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"highpass=f=200,lowpass=f=3500,"
                 f"equalizer=f=120:width_type=h:width=50:g=2.0,equalizer=f=3000:width_type=h:width=1000:g=2.0,"
                 f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,{_pitch_part}"
-                f"asetpts=N/SR/TB,atempo={tempo_factor:.4f},volume=1.35"
+                f"asetpts=N/SR/TB,atempo={tempo_factor:.4f},volume={_dial_vol}"
             )
             bgm_vol_val = 0.28
         else:
@@ -1785,7 +1788,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"highpass=f=200,lowpass=f=3500,"
                 f"equalizer=f=120:width_type=h:width=50:g=2.0,equalizer=f=3000:width_type=h:width=1000:g=2.0,"
                 f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,{_pitch_part}"
-                f"asetpts=N/SR/TB,atempo={tempo_factor:.4f},volume=1.35"
+                f"asetpts=N/SR/TB,atempo={tempo_factor:.4f},volume={_dial_vol}"
             )
             bgm_vol_val = 0.28
 
@@ -2223,7 +2226,12 @@ def mix_bgm_on_merged_video(video_path, output_path, bgm_dir="assets/audio", pre
     # ── অরিজিনাল কণ্ঠ অটুট: হালকা ইকিউ (২০০–৩৫০০ Hz ব্যান্ড-পাস কণ্ঠকে "টেলিফোন"
     #    করে ফেলে) আর BGM আরো নিচে — যাতে শিল্পীর নিজের কথা স্পষ্ট শোনা যায়।
     voice_original = os.environ.get("VOICE_ORIGINAL", "1") != "0"
-    if voice_original:
+    mute_dialogue = os.environ.get("MUTE_DIALOGUE", "0") == "1"
+    if mute_dialogue:
+        # কণ্ঠ বাদ → মূল অডিও চুপ, শুধু গানই শোনা যাবে
+        orig_chain = "[0:a]volume=0[orig]"
+        bgm_vol = os.environ.get("BGM_VOL_MUTE", "0.85")
+    elif voice_original:
         orig_chain = ("[0:a]afftdn=noise_reduction=6,aresample=44100,highpass=f=80,"
                       "lowpass=f=11000,equalizer=f=120:width_type=h:width=50:g=1.0,"
                       "asetpts=N/SR/TB,volume=1.15[orig]")
