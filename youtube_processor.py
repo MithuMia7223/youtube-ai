@@ -747,7 +747,7 @@ class OneEuroFilter:
 #             physically cannot follow a subject up/down. Pre-zooming buys that
 #             room back without changing the final output size.
 TRACK_ZOOM_LONG = 1.02
-TRACK_ZOOM_SHORT = 1.02
+TRACK_ZOOM_SHORT = 1.14   # ১.০২ → ১.১৪: উপরে-নিচে সরার জায়গা নেই বলে মাথা কাটা পড়ত
 
 
 # ─── Face beautification (skin + tone) ───────────────────────────────────
@@ -938,6 +938,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
 
         centers = []  # (cx, cy) in 0..1; None while no subject seen yet
         prev_c = None  # last accepted subject centre (for "sticky" selection)
+        vel = [0.0, 0.0]   # বিষয়ের গতি (prediction-এর জন্য)
+        prev_size = 0.0    # আগের মুখের ক্ষেত্রফল (মাপের ধারাবাহিকতা)
+        misses = 0         # কত ফ্রেম ধরে বিষয় হারিয়ে গেছে
+        tiny = 0           # কত ফ্রেম ধরে বিষয় অন্য মুখের তুলনায় অনেক ছোট
 
         def pick(candidates, prev):
             """
@@ -956,15 +960,26 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 return ((c[0] + c[2] / 2) / sample_w, (c[1] + c[3] / 2) / sample_h)
 
             if prev is not None:
-                best_d, best = None, None
+                # গতিবেগ দিয়ে ভবিষ্যদ্বাণী: দ্রুত হাঁটা/ক্যামেরা প্যানে বিষয়
+                # ৩০%-এর বেশি সরে গেলেও আগের মানুষটাকেই ধরা পড়ে।
+                px = prev[0] + vel[0]
+                py = prev[1] + vel[1]
+                best_key, best = None, None
                 for c in candidates:
                     cx, cy = ctr(c)
-                    d = math.hypot(cx - prev[0], cy - prev[1])
-                    area = c[2] * c[3]
-                    key = (round(d, 4), -area)
-                    if best is None or key < best_d:
-                        best_d, best = key, c
-                if best_d[0] <= 0.30:      # within 30% of frame → same subject
+                    d = math.hypot(cx - px, cy - py)
+                    d_prev = math.hypot(cx - prev[0], cy - prev[1])
+                    # মাপের ধারাবাহিকতা: কাছের মানুষ → দূরের মানুষ লাফ দেওয়া বন্ধ
+                    size_pen = 0.0
+                    if prev_size:
+                        area = c[2] * c[3]
+                        size_pen = min(1.5, abs(math.log(max(area, 1e-6) / prev_size)))
+                    key = (round(d + 0.35 * size_pen, 4), d_prev)
+                    if best_key is None or key < best_key:
+                        best_key, best = key, c
+                # সহনশীল দূরত্ব: আগে ০.৩০ ছিল — দুইজন মানুষ কাছাকাছি এলে
+                # ভুল মানুষ ধরে ফেলত। এখন ০.৫৫ (ভবিষ্যদ্বাণী সহ)।
+                if best_key is not None and best_key[0] <= 0.55:
                     return best, best[4]
 
             biggest = max(candidates, key=lambda c: c[2] * c[3])
@@ -993,6 +1008,24 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
 
             box, is_face = pick(candidates, prev_c)
             if box is not None:
+                misses = 0
+                #もし লক করা মানুষটা পেছনের ছোট কেউ হয় আর সামনে বড় কেউ
+                # ৪ সেকেন্ডের বেশি থাকে → লক ছেড়ে দিই (ভুল মানুষ ধরে রাখা বন্ধ)
+                if candidates:
+                    _big = max(c[2] * c[3] for c in candidates)
+                    if _big > 0 and (box[2] * box[3]) < 0.30 * _big:
+                        tiny += 1
+                        if tiny > int(sample_fps * 4):
+                            prev_c, prev_size, vel, tiny = None, 0.0, [0.0, 0.0], 0
+                    else:
+                        tiny = 0
+            elif prev_c is not None:
+                misses += 1
+                # ২.৫ সেকেন্ড ধরে বিষয় হারিয়ে গেলে তবেই নতুন মানুষ ধরব —
+                # আগে এক ফ্রেম মিসেই পুরোনো পরিচয় মুছে যেত → ভুল মানুষ ধরা পড়ত
+                if misses > int(sample_fps * 2.5):
+                    prev_c, prev_size, vel = None, 0.0, [0.0, 0.0]
+            if box is not None:
                 bx, by, bw, bh = box[:4]
                 raw_c = ((bx + bw / 2) / sample_w, (by + bh / 2) / sample_h)
                 # For face hits, aim the frame centre at the upper body (chest)
@@ -1005,10 +1038,15 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 # এখন ৩%-এ সীমিত, তবু বুক/কাঁধ ফ্রেমে থাকে।
                 chest = min(0.45 * bh / sample_h, 0.03) if is_face else 0.0
                 cy = raw_c[1] + chest
+                if prev_c is not None:
+                    # গতিবেগ = শেষ দুই ডিটেকশনের পার্থক্য (α-স্মুদিত)
+                    vel[0] = 0.6 * (raw_c[0] - prev_c[0]) + 0.4 * vel[0]
+                    vel[1] = 0.6 * (raw_c[1] - prev_c[1]) + 0.4 * vel[1]
                 prev_c = raw_c
+                prev_size = float(bw * bh)
                 centers.append((raw_c[0], min(cy, 1.0)))
             else:
-                prev_c = None
+                # ⚠️ prev_c এখানে মুছি না — পরিচয় ধরে রাখি (উপরে ২.৫s টাইমআউট)
                 centers.append(None)
         proc.stdout.close()
         proc.wait()
@@ -1018,7 +1056,9 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # ২৫% → ১৫%: কম-দৃশ্যমান সাবজেক্টেও ট্র্যাকিং চালু রাখি (ব্যবহারকারীর
         # চাহিদা: "সব ভিডিও ট্র্যাকিং হবে")। তার নিচে হলে স্ট্যাটিক ক্রপই নিরাপদ,
         # কারণ ভুল ডিটেকশন নাড়ালে ক্রপ কাঁপে — সেটা আরও খারাপ দেখায়।
-        if n == 0 or found < max(2, int(n * 0.15)):
+        # ১৫% → ৫%: অর্ধেক ফ্রেমে মুখ না পেলেও আংশিক ট্র্যাক স্ট্যাটিক ক্রপের
+        # চেয়ে ভালো — স্ট্যাটিক ক্রপে বিষয় ফ্রেমের বাইরে চলে যায়।
+        if n == 0 or found < max(2, int(n * 0.05)):
             print(f"[subject-track] No stable subject ({found}/{n} samples); keeping static center crop")
             return None
         if found < int(n * 0.5):
@@ -1064,9 +1104,13 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         rel_y = median3(rel_y)
 
         # Desired crop offsets in the *cropped* frame's pixels, for every sample
+        # শর্টসে মুখ মাঝখানে না রেখে একটু নিচে (৫৫%) রাখি — মাথার উপরে
+        # হেডরুম থাকে, ছাদের/উপরের কিনারার কাটা পড়া বন্ধ হয়।
+        face_y_frac = 0.55 if is_short else 0.50
+
         def targets(rel_xv, rel_yv):
             tx = rel_xv * eff_w - crop_w / 2
-            ty = rel_yv * eff_h - crop_h / 2
+            ty = rel_yv * eff_h - crop_h * face_y_frac
             return (
                 min(max(tx, 0), eff_w - crop_w),
                 min(max(ty, 0), eff_h - crop_h),
@@ -1084,8 +1128,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         snap_dist = crop_w * 0.35          # bigger than this = scene cut
 
         def spring(track):
-            k, c = 9.0, 5.7                # ωn ≈ 3.0 rad/s, ζ ≈ 0.95 (দ্রুত, দোলা ছাড়া)
-            vmax = max(60.0, crop_w * 0.08) / dt
+            # ωn ৩ → ১২ rad/s (ζ = ১.০): আগের স্প্রিং এত ধীর ছিল যে ক্যামেরা
+            # প্যান করলে কয়েকশো মিলিসেকেন্ড বিষয় ফ্রেমের কিনারায়/বাইরে চলে যেত।
+            k, c = 144.0, 24.0              # ωn ≈ 12 rad/s, ζ ≈ 1.0
+            vmax = max(240.0, crop_w * 0.55) / dt
             pos, vel, out = track[0], 0.0, []
             for target in track:
                 err = target - pos
@@ -1108,6 +1154,20 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
 
         sm_x = spring(txs) if track_x else list(txs)
         sm_y = spring(tys) if track_y else list(tys)
+
+        # ── হার্ড-কনটেইনমেন্ট (আসল গ্যারান্টি) ────────────────────────────
+        # স্মুদিং যত ভালোই হোক, দ্রুত প্যানে উইন্ডো পিছিয়ে পড়ে → বিষয় ফ্রেমের
+        # কিনারায়/বাইরে চলে যায়। তাই প্রতিটি স্যাম্পলে উইন্ডোকে বাধ্যতামূলক
+        # ভাবে কাঙ্ক্ষিত অবস্থানের ±২২% ক্রপ-প্রস্থের ভিতরে রাখি: বিষয় কখনোই
+        # ফ্রেমের বাইরে যেতে পারবে না, কিন্তু নড়াচড়া তখনো মসৃণ থাকে।
+        def contain(sm, tg, crop_sz):
+            lim = 0.22 * crop_sz
+            return [max(t - lim, min(t + lim, s)) for s, t in zip(sm, tg)]
+
+        if track_x:
+            sm_x = contain(sm_x, txs, crop_w)
+        if track_y:
+            sm_y = contain(sm_y, tys, crop_h)
 
         def sample_at(track, input_t):
             """Linear interpolation of the 5 Hz track at any input timestamp."""
