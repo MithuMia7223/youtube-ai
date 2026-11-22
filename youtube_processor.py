@@ -836,7 +836,7 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
     )
 
 
-def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0, out_fps=30.0,
+def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0, out_fps=None,
                             content_w=None, content_h=None, pre_crop=""):
     """
     Subject-tracking (face + body) crop helper.
@@ -870,8 +870,17 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         try:
             src_w, src_h = clip.size
             duration = clip.duration
+            src_fps = float(getattr(clip, "fps", 0) or 0)
         finally:
             clip.close()
+        # ⚠️ sendcmd কমান্ড **আউটপুট ফ্রেমের** সাথে মিলতে হবে। আগে ডিফল্ট ৩০ fps
+        # ধরে নেওয়া হতো, কিন্তু সোর্স ২৫ fps হলে আউটপুটও ২৫ fps — তখন ক্রপ
+        # ভুল সময়ে বসে গিয়ে ছবি কেঁপে যেত ("shake")। তাই আসল fps ব্যবহার করি।
+        if not out_fps:
+            # আউটপুট ফ্রেম = সোর্স ফ্রেম (setpts শুধু সময় সংকুচিত করে), তাই
+            # কার্যকর fps = src_fps × speed — কমান্ড ঠিক এই ছন্দে বসালেই প্রতিটি
+            # ফ্রেমে সঠিক অবস্থান পড়ে (এবং ছবি আর কাঁপে না)।
+            out_fps = (src_fps * speed_factor) if src_fps and src_fps > 1 else 30.0
         # ⚠️ বার কাটা হলে ক্রপ-ফিল্টার যে ফ্রেমটা দেখে সেটা ছোট — ট্র্যাকিংও
         # ঠিক ওই ফ্রেমের মাপে হিসাব করতে হবে, নইলে বিষয় ফ্রেমের কিনারায় চলে যায়।
         if content_w and content_h:
@@ -1189,11 +1198,15 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             সারাক্ষণ গড়িয়ে চলার বদলে।
             """
             dt = 1.0 / sample_fps
-            idle_zone = crop_sz * 0.08   # ১৫% → ১০%: বিষয় আরো মাঝখানে      # এর ভিতরে থাকলে স্থির
-            settle = crop_sz * 0.025         # এত কাছে এলে থেমে যাই
-            slow = crop_sz * 0.10           # px/সেকেন্ড — মসৃণ প্যান
-            fast = crop_sz * 0.50           # px/সেকেন্ড — হারিয়ে যাচ্ছে
-            tau = 0.5
+            # ব্যবহারকারীর রিপোর্ট: "নরচরা করে, shake করে"। তাই:
+            #   • বড় ডেড-জোন (২২%) — এর ভিতরে থাকলে ক্যামেরা **এক পিক্সেলও নড়ে না**
+            #   • খুব ধীর প্যান (৮% ক্রপ/সেকেন্ড) — চোখে প্রায় অদৃশ্য
+            #   • বড় tau (০.৯s) — নরম ইজিং, হঠাৎ শুরু/থামা নেই
+            idle_zone = crop_sz * 0.22
+            settle = crop_sz * 0.06
+            slow = crop_sz * 0.08
+            fast = crop_sz * 0.45
+            tau = 0.9
             pos, moving, out = track[0], False, []
             for tgt in track:
                 err = tgt - pos
