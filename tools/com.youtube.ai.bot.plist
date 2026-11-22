@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/mdmithumia</string>
+		<key>PATH</key>
+		<string>/Users/mdmithumia/.deno/bin:/Users/mdmithumia/other_projects/youtube-ai/.venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>ExitTimeOut</key>
+	<integer>3600</integer>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.youtube.ai.bot</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/mdmithumia/other_projects/youtube-ai/run_bot.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/mdmithumia/other_projects/youtube-ai/bot_stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/mdmithumia/other_projects/youtube-ai/bot_stdout.log</string>
+	<key>ThrottleInterval</key>
+	<integer>15</integer>
+</dict>
+</plist>

@@ -12,3 +12,4 @@ client_secrets.json
 venv/
 .venv/
 bot.lock
+.job_state.json

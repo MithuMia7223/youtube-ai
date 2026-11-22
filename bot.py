@@ -2,6 +2,8 @@ import os
 import shutil
 import subprocess
 import time
+import json
+import glob
 import threading
 from datetime import datetime
 from dotenv import load_dotenv
@@ -34,7 +36,6 @@ def _single_instance_or_die():
     global _LOCK_FH
     import fcntl
     import sys as _sys
-
     lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.lock")
     fh = open(lock_path, "w")
     try:
@@ -66,6 +67,155 @@ if _API_BASE:
     print(f"[upload] লোকাল Bot API সার্ভার ব্যবহার হচ্ছে → {_API_BASE} (সীমা ~২ GB)")
 else:
     print("[upload] স্ট্যান্ডার্ড Bot API — বটের সীমা ৫০ MB (আনলিমিটেড নয়)")
+
+# ── জব রেজিস্ট্রি: রিস্টার্ট/আপডেটের সময় কাজ নষ্ট না হওয়ার জন্য ─────────────
+# কেন: আগে বট রিস্টার্ট করলে চলতি ভিডিওর কাজ (ডাউনলোড/প্রসেসিং) মাঝপথে
+# মরে যেত, অর্ধেক ফাইল ডিস্কে পড়ে থাকত, ভিডিও চ্যাটে পৌঁছাত না।
+# এখন: চলতি কাজের হিসাব ফাইলে থাকে → রিস্টার্ট দিলে বট কাজ শেষ করে তারপর বন্ধ হয়,
+# আর কোনো কারণে মরে গেলে পরের বার নিজেই ফাইল পরিষ্কার করে জানিয়ে দেয়।
+_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_JOB_PATH = os.path.join(_ROOT_DIR, ".job_state.json")
+_JOB_LOCK = threading.RLock()
+_jobs: dict[str, dict] = {}
+_draining = False
+
+
+def _jobs_snapshot() -> dict:
+    with _JOB_LOCK:
+        return {"pid": os.getpid(), "at": time.time(), "draining": _draining,
+                "jobs": {k: dict(v) for k, v in _jobs.items()}}
+
+
+def _job_save() -> None:
+    """স্টেট ফাইল লিখি (নীলতের জন্য atomic) — বাইরের স্ক্রিপ্ট এটা পড়ে অপেক্ষা করে।"""
+    try:
+        tmp = _JOB_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_jobs_snapshot(), fh, ensure_ascii=False)
+        os.replace(tmp, _JOB_PATH)
+    except Exception as e:
+        print(f"[job] স্টেট লেখা গেল না: {e}")
+
+
+def jobs_active() -> int:
+    with _JOB_LOCK:
+        return len(_jobs)
+
+
+def _job_begin(chat_id: int, kind: str, label: str = "") -> str:
+    jid = f"{int(time.time())}-{threading.get_ident()}"
+    with _JOB_LOCK:
+        _jobs[jid] = {"chat": chat_id, "kind": kind, "label": (label or "")[:150],
+                      "started": time.time(), "step": "শুরু"}
+        _job_save()
+        n = len(_jobs)
+    print(f"[job] শুরু ({n} চলছে): {kind} · {(label or '')[:70]}")
+    return jid
+
+
+def _job_step(jid: str, step: str) -> None:
+    with _JOB_LOCK:
+        if jid in _jobs:
+            _jobs[jid]["step"] = step[:130]
+            _job_save()
+
+
+def _job_end(jid: str) -> None:
+    with _JOB_LOCK:
+        _jobs.pop(jid, None)
+        _job_save()
+        left = len(_jobs)
+    print(f"[job] শেষ ({left} চলছে)")
+    if _draining and left == 0:
+        print("[shutdown] সব কাজ শেষ — এখন বন্ধ হচ্ছি")
+        time.sleep(0.4)
+        os._exit(0)
+
+
+def _busy_or_draining(chat_id: int) -> bool:
+    """রিস্টার্টের অপেক্ষায় থাকলে নতুন কাজ নেব না (কাজ হারানো এড়াতে)।"""
+    if not _draining:
+        return False
+    try:
+        bot.send_message(chat_id, "⏳ বট আপডেট হচ্ছে — ১-২ মিনিট পরে লিংকটা আবার পাঠাও।")
+    except Exception:
+        pass
+    return True
+
+
+def _install_signal_handlers() -> None:
+    import signal as _sig
+
+    def _handler(signum, frame):
+        global _draining
+        if _draining:
+            return
+        _draining = True
+        n = jobs_active()
+        if n == 0:
+            print("[shutdown] কোনো কাজ চলছে না — এখনই বন্ধ হচ্ছি")
+            os._exit(0)
+        print(f"[shutdown] {n}টা কাজ চলছে — সব শেষ করে বন্ধ হব (নতুন কাজ বন্ধ)")
+        _job_save()
+        for j in list(_jobs.values()):
+            try:
+                bot.send_message(j["chat"],
+                                 "🔄 বট আপডেট হচ্ছে — তোমার চলতি ভিডিওটা আগে শেষ হবে, "
+                                 "তারপর বট রিস্টার্ট হবে। কিছুই হারাবে না।")
+            except Exception:
+                pass
+
+    for s in (_sig.SIGTERM, _sig.SIGINT):
+        try:
+            _sig.signal(s, _handler)
+        except Exception:
+            pass
+
+
+_RECOVER_PATTERNS = ("raw_seg_*", "proc_seg_*", "merged_raw_*", "concat_list_*",
+                     "narr_audio_*", "thumb_*.jpg", "processed_*.mp4", "raw_download_*")
+
+
+def _startup_recovery() -> None:
+    """গতবার অসম্পূর্ণ জব থাকলে: চ্যাটকে জানাই + বাকি ফাইল পরিষ্কার করি।"""
+    try:
+        with open(_JOB_PATH, encoding="utf-8") as fh:
+            stale = json.load(fh)
+    except Exception:
+        stale = None
+
+    jobs = (stale or {}).get("jobs") or {}
+    if jobs:
+        mins = (time.time() - float(stale.get("at") or 0)) / 60
+        print(f"[recover] অসম্পূর্ণ কাজ পাওয়া গেছে: {len(jobs)}টা ({mins:.0f} মিনিট আগে)")
+        for j in jobs.values():
+            try:
+                bot.send_message(
+                    j.get("chat") or 0,
+                    "⚠️ আগের কাজটা শেষ হতে পারেনি (বট/মেশিন বন্ধ হয়ে গিয়েছিল)।\n"
+                    f"🔗 `{(j.get('label') or '')[:100]}`\n\n"
+                    "লিংকটা আবার পাঠাও — সাথে সাথে করে দিচ্ছি।",
+                    parse_mode="Markdown")
+            except Exception as e:
+                print(f"[recover] বার্তা গেল না: {e}")
+
+    # অসম্পূর্ণ ফাইল (২ মিনিটের পুরোনো) — নতুন করে শুরু করার আগে মুছে ফেলি
+    freed = 0
+    for pat in _RECOVER_PATTERNS:
+        for f in glob.glob(os.path.join(_ROOT_DIR, pat)):
+            try:
+                if time.time() - os.path.getmtime(f) > 120:
+                    freed += os.path.getsize(f)
+                    os.remove(f)
+            except Exception:
+                pass
+    if freed:
+        print(f"[recover] {freed / 1048576:.0f} MB অসম্পূর্ণ ফাইল পরিষ্কার হলো")
+    try:
+        os.remove(_JOB_PATH)
+    except Exception:
+        pass
+
 
 # ── User session store ────────────────────────────────────────────────────────
 user_sessions = {}
@@ -493,6 +643,17 @@ def _start_video_creation(chat_id: int, topic: str, is_short: bool = False):
 
 
 def _full_video_pipeline(chat_id: int, topic: str, is_short: bool, custom_script: str = None):
+    """জব-গার্ড সহ মোড়ক — কাজের হিসাব রাখে যাতে রিস্টার্টে নষ্ট না হয়।"""
+    if _busy_or_draining(chat_id):
+        return
+    jid = _job_begin(chat_id, "faceless", topic)
+    try:
+        return _full_video_pipeline_inner(chat_id, topic, is_short, custom_script)
+    finally:
+        _job_end(jid)
+
+
+def _full_video_pipeline_inner(chat_id: int, topic: str, is_short: bool, custom_script: str = None):
     """
     Full pipeline:
     Script → AI Images per Scene → TTS → Render → Thumbnail → YouTube Upload
@@ -1782,6 +1943,17 @@ def generate_clickbait_metadata(original_title, original_desc=""):
             time.sleep(2)
 
 def _run_youtube_pipeline_auto(chat_id: int, url: str, is_short: bool, original_title: str, duration: int):
+    """জব-গার্ড সহ মোড়ক — লিংকের কাজ শেষ হওয়ার আগে বট বন্ধ হবে না।"""
+    if _busy_or_draining(chat_id):
+        return
+    jid = _job_begin(chat_id, "youtube", f"{original_title} · {url}")
+    try:
+        return _run_youtube_pipeline_auto_inner(chat_id, url, is_short, original_title, duration)
+    finally:
+        _job_end(jid)
+
+
+def _run_youtube_pipeline_auto_inner(chat_id: int, url: str, is_short: bool, original_title: str, duration: int):
     import os
     import random
     import subprocess
@@ -2146,6 +2318,10 @@ if __name__ == '__main__':
     print("=" * 50)
     print("  YouTube AI Income Bot Starting...")
     print("=" * 50)
+
+    # রিস্টার্ট/আপডেটের সময় চলতি কাজ যেন নষ্ট না হয়
+    _install_signal_handlers()
+    _startup_recovery()
 
     # Start auto-schedule background worker
     schedule_thread = threading.Thread(target=_auto_schedule_worker, daemon=True)
