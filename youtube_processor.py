@@ -1030,7 +1030,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 try:
                     d = cv2.absdiff(gray, prev_gray_ref[0])
                     d = cv2.GaussianBlur(d, (5, 5), 0)
-                    _th, mask = cv2.threshold(d, 22, 255, cv2.THRESH_BINARY)
+                    _th, mask = cv2.threshold(d, 18, 255, cv2.THRESH_BINARY)   # ২২→১৮: মৃদু নড়াচড়াও ধরা পড়ে
                     mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
                     cnts, _h = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                                 cv2.CHAIN_APPROX_SIMPLE)
@@ -1038,6 +1038,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                     cand = [c for c in cand if c[2] * c[3] > 0.015 * sample_w * sample_h]
                     whole = [c for c in cand if c[2] * c[3] > 0.55 * sample_w * sample_h]
                     cand = [c for c in cand if c not in whole]   # গোটা ফ্রেম নড়া = ক্যামেরা
+                    # টাইটেল/এন্ড-কার্ড (গ্রাফিক) হলে বড় "মোশন" দেখায় কিন্তু
+                    # বিষয় থাকে না — বড় জোন (২৫%+) বাদ দিই; সব বাদ পড়লে
+                    # ক্রপ শেষ অবস্থানেই স্থির থাকে (টাইটেলে ক্যামেরা ঘোরানো ঠিক নয়)।
+                    cand = [c for c in cand if c[2] * c[3] < 0.25 * sample_w * sample_h]
                     if cand:
                         if prev_c is not None:
                             cand.sort(key=lambda c: math.hypot(
@@ -1159,7 +1163,9 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         rel_y = median5(rel_y)
 
         # Desired crop offsets in the *cropped* frame's pixels, for every sample
-        face_y_frac = 0.50   # v1-এর মতো ঠিক মাঝখানে
+        # মাথার উপরে জায়গা: টার্গেট-লাইন ৫০% → ৪২% (মুখ একটু উপরে,
+        # শরীর নিচে — গ্রুপ শটে মাথা কাটা পড়ে না)
+        face_y_frac = 0.42 if is_short else 0.50
 
         def targets(rel_xv, rel_yv):
             tx = rel_xv * eff_w - crop_w / 2
@@ -1210,7 +1216,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             pos, moving, out = track[0], False, []
             for tgt in track:
                 err = tgt - pos
-                if abs(err) > crop_sz * 0.35:
+                if abs(err) > crop_sz * 0.25:
                     # দৃশ্য বদল → সাথে সাথে বসাই। (০.৬ ক্রপ/সেকেন্ডের "গ্লাইড"
                     # চেষ্টা করেছিলাম — তাতে কয়েক ফ্রেম বিষয় কিনারায় গিয়ে
                     # **কাটা পড়ত**। ব্যবহারকারীর রিপোর্ট: "কাটে কাটে দেখা যাচ্ছে"।)
