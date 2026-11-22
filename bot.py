@@ -1978,7 +1978,10 @@ def _run_youtube_pipeline_auto_inner(chat_id: int, url: str, is_short: bool, ori
         outro_file = os.path.join("assets", "audio", f"outro_{chat_id}.mp3")
         
         avatar_path = avatar_file if os.path.exists(avatar_file) else None
-        outro_path = outro_file if os.path.exists(outro_file) else None
+        # তোমার দেওয়া প্রফেশনাল ভয়েস (outro) — ডিফল্টে বন্ধ রাখা হলো,
+        # যাতে নাটকের নিজের কণ্ঠই শোনা যায়। চাইলে .env-এ OUTRO_VOICE=1।
+        _use_outro = os.environ.get("OUTRO_VOICE", "1") != "0"
+        outro_path = outro_file if (os.path.exists(outro_file) and _use_outro) else None
         
         video_id = extract_video_id(url)
         bot.send_message(chat_id, "🤖 Gemini AI দিয়ে ভিডিওর ট্রান্সক্রিপ্ট বিশ্লেষণ করা হচ্ছে (সেরা দৃশ্যগুলো খুঁজে বের করার জন্য)...")
