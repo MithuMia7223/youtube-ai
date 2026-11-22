@@ -819,7 +819,7 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
         out = f"scale={out_w or 1080}:{out_h or 1080}:flags=lanczos"
         return (
             f"scale=iw*{z}:ih*{z},{face_cmd_prefix}"
-            f"crop=w='trunc(min(iw,ih)/{z}/2)*2':h='trunc(min(iw,ih)/{z}/2)*2':"
+            f"crop@sq=w='trunc(min(iw,ih)/{z}/2)*2':h='trunc(min(iw,ih)/{z}/2)*2':"
             f"x='(iw-ow)/2':y='(ih-oh)/2',{out}"
         )
     # লং: ক্রপ-উইন্ডো **১৬:৯** — উৎস ৪:৩ বা ৯:১৬ হলেও আউটপুট বিকৃত হবে না,
@@ -830,7 +830,7 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
     # হয়ে যায় (ঠিক এই ভুলটাই হয়েছিল)। ক্রপ-উইন্ডো ১৬:৯, তাই scale-ই যথেষ্ট।
     return (
         f"{face_cmd_prefix}"
-        f"crop=w='trunc(min(iw,ih*16/9)/{TRACK_ZOOM_LONG}/2)*2':"
+        f"crop@sq=w='trunc(min(iw,ih*16/9)/{TRACK_ZOOM_LONG}/2)*2':"
         f"h='trunc(min(ih,iw*9/16)/{TRACK_ZOOM_LONG}/2)*2':"
         f"x='(iw-ow)/2':y='(ih-oh)/2',{out},setsar=1"
     )
@@ -1129,10 +1129,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             t_in = min(t_out * speed_factor, max(duration - 1e-3, 0.0))
             if track_x:
                 x_px = int(round(min(max(sample_at(sm_x, t_in), 0), eff_w - crop_w)))
-                lines.append(f"{t_out:.3f} crop x {x_px};")
+                lines.append(f"{t_out:.3f} crop@sq x {x_px};")
             if track_y:
                 y_px = int(round(min(max(sample_at(sm_y, t_in), 0), eff_h - crop_h)))
-                lines.append(f"{t_out:.3f} crop y {y_px};")
+                lines.append(f"{t_out:.3f} crop@sq y {y_px};")
         if not lines:
             return None
 
@@ -1210,7 +1210,7 @@ def detect_letterbox(path, samples=(0.15, 0.35, 0.55, 0.75, 0.9), limit=24):
     # খুব ছোট পার্থক্য (<১.৫%) উপেক্ষা — কোডেক-নয়েজ, আসল বার নয়
     if (iw - w) < iw * 0.015 and (ih - h) < ih * 0.015:
         return None
-    return f"crop={w}:{h}:{x}:{y},"
+    return f"crop@bars={w}:{h}:{x}:{y},"
 
 
 # ── BGM বাছাই: নিজের গান (own) → CC0 ────────────────────────────
@@ -1933,6 +1933,11 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                     # Reset encoder cache so next run tries hardware again
                     global _encoder_cache
                     _encoder_cache = None
+                # শেষ গার্ড: কোনো কারণে বার থেকে গেলে নিজেই কেটে ঠিক করি
+                try:
+                    strip_bars(output_path, target=(_LW, _LH))
+                except Exception as _e:
+                    print(f"[bars] যাচাই ব্যর্থ (উপেক্ষা): {_e}")
                 return output_path
             except subprocess.CalledProcessError as e:
                 last_err = e
@@ -1951,6 +1956,94 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 os.remove(face_cmd_file)
             except Exception:
                 pass
+
+# ── শেষ গার্ড: রেন্ডারের পরেও বার আছে কিনা যাচাই + নিজেই ঠিক করা ──────────
+def detect_bars(path, samples=10, size=96, thresh=10, min_frac=0.012):
+    """পোড়া বার মাপি — অনেক ফ্রেমের **সর্বোচ্চ** উজ্জ্বলতা দেখে।
+
+    কেন এভাবে: এক ফ্রেমে অন্ধকার দৃশ্য থাকতেই পারে; কিন্তু আসল বার সব
+    ফ্রেমেই কালো থাকে। তাই max-over-time ব্যবহার করলে ভুল সনাক্ত হয় না।
+    """
+    import subprocess as _sp, shutil as _sh
+    try:
+        import numpy as _np
+    except Exception:
+        return None
+    w, h = probe_size(path)
+    if not w or not h:
+        return None
+    ff = _sh.which("ffmpeg") or "ffmpeg"
+    try:
+        raw = _sp.run([ff, "-v", "quiet", "-i", str(path),
+                       "-vf", f"fps=1/2,scale={size}:{size}",
+                       "-frames:v", str(samples), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                      capture_output=True, timeout=120).stdout
+    except Exception:
+        return None
+    a = _np.frombuffer(raw, dtype=_np.uint8)
+    n = a.size // (size * size)
+    if n < 1:
+        return None
+    st = a[:n * size * size].reshape(n, size, size)
+    rows = st.max(axis=(0, 2))
+    cols = st.max(axis=(0, 1))
+
+    def _lead(m):
+        k = 0
+        while k < len(m) and m[k] < thresh:
+            k += 1
+        return k
+
+    def _trail(m):
+        k = 0
+        while k < len(m) and m[-1 - k] < thresh:
+            k += 1
+        return k
+
+    t, b, l, r = _lead(rows), _trail(rows), _lead(cols), _trail(cols)
+    tp, bp = round(t / size * h), round(b / size * h)
+    lp, rp = round(l / size * w), round(r / size * w)
+    if (tp + bp) < h * min_frac and (lp + rp) < w * min_frac:
+        return None
+    return w, h, tp, bp, lp, rp
+
+
+def strip_bars(path, target=None):
+    """আউটপুটে বার থাকলে কেটে ফ্রেম পুরো ভরাট করি (ক্রপ + সেন্টার জুম)।
+
+    True ফেরত দেয় যদি ফাইল ঠিক করতে হয়েছে।
+    """
+    if os.environ.get("FINAL_BAR_GUARD", "1") == "0":
+        return False
+    info = detect_bars(path)
+    if not info:
+        return False
+    w, h, tp, bp, lp, rp = info
+    cw, ch = w - lp - rp, h - tp - bp
+    if cw < w * 0.5 or ch < h * 0.5:      # ভুল সনাক্তকরণ — হাত দিই না
+        return False
+    tw, th = target or (w, h)
+    out = str(path) + ".nobar.mp4"
+    vf = (f"crop={cw}:{ch}:{lp}:{tp},"
+          f"scale={tw}:{th}:force_original_aspect_ratio=increase:flags=lanczos,"
+          f"crop={tw}:{th},setsar=1")
+    import shutil as _sh
+    ff = _sh.which("ffmpeg") or "ffmpeg"
+    print(f"[bars] আউটপুটে বার মিলেছে (উপর {tp}px, নিচ {bp}px, বাঁ {lp}px, ডান {rp}px) — কেটে ভরাট করছি")
+    try:
+        subprocess.run([ff, "-y", "-i", str(path), "-vf", vf,
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                        "-c:a", "copy", "-movflags", "+faststart", out],
+                       check=True, capture_output=True)
+        os.replace(out, str(path))
+        return True
+    except Exception as e:
+        print(f"[bars] ঠিক করা গেল না: {e}")
+        try:
+            os.remove(out)
+        except Exception:
+            pass
+        return False
 
 def compress_video_if_needed(input_path, max_size_mb=None):
     """
