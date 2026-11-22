@@ -836,7 +836,8 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
     )
 
 
-def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0, out_fps=30.0):
+def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0, out_fps=30.0,
+                            content_w=None, content_h=None, pre_crop=""):
     """
     Subject-tracking (face + body) crop helper.
 
@@ -871,6 +872,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             duration = clip.duration
         finally:
             clip.close()
+        # ⚠️ বার কাটা হলে ক্রপ-ফিল্টার যে ফ্রেমটা দেখে সেটা ছোট — ট্র্যাকিংও
+        # ঠিক ওই ফ্রেমের মাপে হিসাব করতে হবে, নইলে বিষয় ফ্রেমের কিনারায় চলে যায়।
+        if content_w and content_h:
+            src_w, src_h = float(content_w), float(content_h)
         if not src_w or not src_h or not duration or duration < 1.0:
             return None
 
@@ -902,7 +907,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         sample_cmd = [
             "ffmpeg", "-v", "error",
             "-i", input_path,
-            "-vf", f"hflip,fps={sample_fps},scale={sample_w}:{sample_h}",
+            "-vf", f"{pre_crop}hflip,fps={sample_fps},scale={sample_w}:{sample_h}",
             "-pix_fmt", "bgr24",
             "-f", "rawvideo", "pipe:1",
         ]
@@ -1394,11 +1399,8 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     # শুধু শর্টস-চেইনে ফেস-ক্রপ ব্যবহার হয়। লং-ফর্ম এখন ফুল-ব্লিড cover-crop করে,
     # তাই ওখানে sendcmd লাগে না। আগে সব ভিডিওতে ৫ fps-এ YuNet/Haar চলত →
     # ৩০ মিনিটের লং ভিডিওতে হাজার হাজার ফ্রেম বিশ্লেষণ = পুরো সময়ের বড় অংশ নষ্ট।
-    face_cmd_file = compute_face_sendcmd_file(
-        input_path, speed_factor, sq,
-        sample_fps=12.0 if sq else 5.0,
-    )
-    face_cmd_prefix = f"sendcmd=f='{face_cmd_file}'," if face_cmd_file else ""
+    face_cmd_file = None
+    face_cmd_prefix = ""
     
     # Randomize EQ values per run for viral cinematic drama style (high contrast, warm skin tones, vibrant saturation)
     rand_contrast = round(random.uniform(1.12, 1.20), 3)
@@ -1500,6 +1502,29 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
             print(f"[letterbox] উৎসের কালো বার কাটা হচ্ছে: {_bars.rstrip(',')}")
     except Exception as _e:
         print(f"[letterbox] সনাক্তকরণ ব্যর্থ (উপেক্ষা): {_e}")
+
+    # ── ফেস-ট্র্যাকিং: **বার কাটার পরে** যে ফ্রেমটা থাকে, তার মাপে হিসাব ──
+    # আগে পুরো ফ্রেমের (১০৮০) মাপে হিসাব হতো, কিন্তু ক্রপ-ফিল্টার দেখত
+    # ৮৬৪ উচ্চতার ফ্রেম → বিষয় ফ্রেমের কিনারায়/কাটা পড়ত ("মাঝে মাঝে ট্র্যাক
+    # ঠিক জায়গায় বসে না")। এখন কনটেন্ট-মাপ + একই প্রি-ক্রপ দিয়ে স্যাম্পল করি।
+    _cw, _ch, _pre = None, None, ""
+    if _bars:
+        try:
+            _nums = _bars.replace("crop@bars=", "").strip(",;").split(":")
+            _cw, _ch = int(_nums[0]), int(_nums[1])
+            _pre = _bars if _bars.endswith(",") else _bars + ","
+        except Exception:
+            _cw, _ch = None, None
+    try:
+        face_cmd_file = compute_face_sendcmd_file(
+            input_path, speed_factor, sq,
+            sample_fps=12.0 if sq else 5.0,
+            content_w=_cw, content_h=_ch, pre_crop=_pre,
+        )
+        face_cmd_prefix = f"sendcmd=f='{face_cmd_file}'," if face_cmd_file else ""
+    except Exception as _e:
+        print(f"[subject-track] ট্র্যাকিং বাদ (উপেক্ষা): {_e}")
+        face_cmd_file, face_cmd_prefix = None, ""
 
     inputs_count = 1
     
