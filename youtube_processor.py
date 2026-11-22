@@ -747,7 +747,7 @@ class OneEuroFilter:
 #             physically cannot follow a subject up/down. Pre-zooming buys that
 #             room back without changing the final output size.
 TRACK_ZOOM_LONG = 1.02
-TRACK_ZOOM_SHORT = 1.14   # ১.০২ → ১.১৪: উপরে-নিচে সরার জায়গা নেই বলে মাথা কাটা পড়ত
+TRACK_ZOOM_SHORT = 1.02   # v1-এর মতো (বেশি জুম = বেশি নড়াচড়া/নরচরা)
 
 
 # ─── Face beautification (skin + tone) ───────────────────────────────────
@@ -942,6 +942,8 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         prev_size = 0.0    # আগের মুখের ক্ষেত্রফল (মাপের ধারাবাহিকতা)
         misses = 0         # কত ফ্রেম ধরে বিষয় হারিয়ে গেছে
         tiny = 0           # কত ফ্রেম ধরে বিষয় অন্য মুখের তুলনায় অনেক ছোট
+        prev_gray_ref = [None]   # মোশন ফলব্যাকের জন্য আগের ফ্রেম (grayscale)
+        motion_hits = [0]        # কত ফ্রেমে মোশন-ফলব্যাক ব্যবহার হয়েছে
 
         def pick(candidates, prev):
             """
@@ -997,8 +999,8 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 if faces is not None and len(faces) > 0:
                     for f in faces:
                         candidates.append((float(f[0]), float(f[1]), float(f[2]), float(f[3]), True))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             if not candidates:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 for det, min_sz, nbrs, face_cascade in haar_detectors:
                     found = det.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=nbrs, minSize=min_sz)
                     if len(found) > 0:
@@ -1007,23 +1009,49 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                         break
 
             box, is_face = pick(candidates, prev_c)
+
+            # ── মোশন ফলব্যাক ────────────────────────────────────────────────
+            # পিঠ ঘুরানো শট, দূরের ওয়াইড শট, অন্ধকার দৃশ্য — মুখ/শরীর কোনোটাই
+            # ধরা পড়ে না। তখন পুরো ক্লিপ স্ট্যাটিক ক্রপে চলে যেত (ব্যবহারকারীর
+            # অভিযোগ: "মাঝে মাঝে ট্র্যাকিং হয় না")। এখন ফ্রেম-পার্থক্য দিয়ে
+            # যেখানে নড়াচড়া হচ্ছে সেটাই ধরি — পুরো ফ্রেম নড়লে (ক্যামেরা প্যান)
+            # সেটা বাদ দিই, কারণ তখন ক্রপ নিজেই ঠিক থাকে।
+            if box is None and prev_gray_ref[0] is not None:
+                try:
+                    d = cv2.absdiff(gray, prev_gray_ref[0])
+                    d = cv2.GaussianBlur(d, (5, 5), 0)
+                    _th, mask = cv2.threshold(d, 22, 255, cv2.THRESH_BINARY)
+                    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
+                    cnts, _h = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                                cv2.CHAIN_APPROX_SIMPLE)
+                    cand = [cv2.boundingRect(c) for c in cnts]
+                    cand = [c for c in cand if c[2] * c[3] > 0.015 * sample_w * sample_h]
+                    whole = [c for c in cand if c[2] * c[3] > 0.55 * sample_w * sample_h]
+                    cand = [c for c in cand if c not in whole]   # গোটা ফ্রেম নড়া = ক্যামেরা
+                    if cand:
+                        if prev_c is not None:
+                            cand.sort(key=lambda c: math.hypot(
+                                (c[0] + c[2] / 2) / sample_w - prev_c[0],
+                                (c[1] + c[3] / 2) / sample_h - prev_c[1]))
+                        else:
+                            cand.sort(key=lambda c: -c[2] * c[3])
+                        box = (float(cand[0][0]), float(cand[0][1]),
+                               float(cand[0][2]), float(cand[0][3]), False)
+                        motion_hits[0] += 1
+                except Exception:
+                    pass
+            prev_gray_ref[0] = gray
+
             if box is not None:
                 misses = 0
-                #もし লক করা মানুষটা পেছনের ছোট কেউ হয় আর সামনে বড় কেউ
-                # ৪ সেকেন্ডের বেশি থাকে → লক ছেড়ে দিই (ভুল মানুষ ধরে রাখা বন্ধ)
-                if candidates:
-                    _big = max(c[2] * c[3] for c in candidates)
-                    if _big > 0 and (box[2] * box[3]) < 0.30 * _big:
-                        tiny += 1
-                        if tiny > int(sample_fps * 4):
-                            prev_c, prev_size, vel, tiny = None, 0.0, [0.0, 0.0], 0
-                    else:
-                        tiny = 0
+                # (v2-তে এখানে "ছোট হলে লক ছেড়ে দাও" নিয়ম ছিল — তাতে ট্র্যাকিং
+                #  মানুষ বদলাত। ব্যবহারকারী চান একই মানুষ ধরে রাখা → সরানো হলো।)
             elif prev_c is not None:
                 misses += 1
                 # ২.৫ সেকেন্ড ধরে বিষয় হারিয়ে গেলে তবেই নতুন মানুষ ধরব —
                 # আগে এক ফ্রেম মিসেই পুরোনো পরিচয় মুছে যেত → ভুল মানুষ ধরা পড়ত
-                if misses > int(sample_fps * 2.5):
+                # ২.৫s → ৬s: বেশি সময় ধরে একই মানুষ ধরে রাখি (কম বার বদলায়)
+                if misses > int(sample_fps * 6.0):
                     prev_c, prev_size, vel = None, 0.0, [0.0, 0.0]
             if box is not None:
                 bx, by, bw, bh = box[:4]
@@ -1104,9 +1132,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         rel_y = median3(rel_y)
 
         # Desired crop offsets in the *cropped* frame's pixels, for every sample
-        # শর্টসে মুখ মাঝখানে না রেখে একটু নিচে (৫৫%) রাখি — মাথার উপরে
-        # হেডরুম থাকে, ছাদের/উপরের কিনারার কাটা পড়া বন্ধ হয়।
-        face_y_frac = 0.55 if is_short else 0.50
+        face_y_frac = 0.50   # v1-এর মতো ঠিক মাঝখানে
 
         def targets(rel_xv, rel_yv):
             tx = rel_xv * eff_w - crop_w / 2
@@ -1127,47 +1153,50 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         dt = 1.0 / sample_fps
         snap_dist = crop_w * 0.35          # bigger than this = scene cut
 
-        def spring(track):
-            # ωn ৩ → ১২ rad/s (ζ = ১.০): আগের স্প্রিং এত ধীর ছিল যে ক্যামেরা
-            # প্যান করলে কয়েকশো মিলিসেকেন্ড বিষয় ফ্রেমের কিনারায়/বাইরে চলে যেত।
-            k, c = 144.0, 24.0              # ωn ≈ 12 rad/s, ζ ≈ 1.0
-            vmax = max(240.0, crop_w * 0.55) / dt
-            pos, vel, out = track[0], 0.0, []
-            for target in track:
-                err = target - pos
-                if abs(err) > snap_dist:
-                    # Scene cut: the subject did not travel across the frame,
-                    # the frame replaced itself. Cut with it instead of sliding.
-                    pos, vel = target, 0.0
+        def stabilise(track, crop_sz):
+            """
+            শান্ত ক্যামেরা — "ডেড-জোন + সেন্টার-স্ন্যাপ" (ব্রডকাস্টে এভাবেই হয়)।
+
+            সমস্যা ছিল দুইদিকেই: ক্যামেরা সারাক্ষণ মাইক্রো-নড়াচড়া করত
+            ("নরচরা"), আবার দ্রুত প্যানে বিষয় বাইরে চলে যেত। সমাধান:
+
+              ১. বিষয় কেন্দ্রের ±১৫% এর ভিতরে থাকলে ক্যামেরা **সম্পূর্ণ স্থির**
+                 (এক পিক্সেলও নড়ে না → ছবি স্থির, চোখে আরাম)
+              ২. বিষয় ১৫% ছাড়ালে একবার **পূর্ণ-সেন্টার** করার জন্য মসৃণ ভাবে এগোয়
+              ৩. সেন্টারে (±৩%) পৌঁছালে আবার থেমে যায় → দীর্ঘ সময় স্থির
+              ৪. বিষয় ২৫% ছাড়ালে দ্রুত ধরে (৫০%/s) — ফ্রেমের বাইরে যেতে দেয় না
+              ৫. শেষে হার্ড-সীমা: বিষয় সবসময় ফ্রেমের ২৫–৭৫% এর ভিতরে
+
+            ফলে নড়াচড়া হয় **কম সংখ্যকবার, প্রতিবার মসৃণ ও উদ্দেশ্যপূর্ণ** —
+            সারাক্ষণ গড়িয়ে চলার বদলে।
+            """
+            dt = 1.0 / sample_fps
+            idle_zone = crop_sz * 0.10   # ১৫% → ১০%: বিষয় আরো মাঝখানে      # এর ভিতরে থাকলে স্থির
+            settle = crop_sz * 0.025         # এত কাছে এলে থেমে যাই
+            slow = crop_sz * 0.10           # px/সেকেন্ড — মসৃণ প্যান
+            fast = crop_sz * 0.50           # px/সেকেন্ড — হারিয়ে যাচ্ছে
+            tau = 0.5
+            pos, moving, out = track[0], False, []
+            for tgt in track:
+                err = tgt - pos
+                if abs(err) > crop_sz * 0.35:      # দৃশ্য বদল → সাথে সাথে
+                    pos, moving = tgt, False
                     out.append(pos)
                     continue
-                vel += (k * err - c * vel) * dt
-                vel = max(-vmax, min(vmax, vel))
-                pos += vel * dt
+                if not moving and abs(err) > idle_zone:
+                    moving = True
+                if moving and abs(err) < settle:
+                    moving = False
+                if moving:
+                    step = err * min(1.0, dt / tau)
+                    cap = (fast if abs(err) > crop_sz * 0.25 else slow) * dt
+                    pos += max(-cap, min(cap, step))
                 out.append(pos)
-            if len(out) > 2:
-                out = [out[0]] + [
-                    (out[i - 1] + 2.0 * out[i] + out[i + 1]) / 4.0
-                    for i in range(1, len(out) - 1)
-                ] + [out[-1]]
-            return out
+            lim = crop_sz * 0.25
+            return [max(tgt - lim, min(tgt + lim, s)) for s, tgt in zip(out, track)]
 
-        sm_x = spring(txs) if track_x else list(txs)
-        sm_y = spring(tys) if track_y else list(tys)
-
-        # ── হার্ড-কনটেইনমেন্ট (আসল গ্যারান্টি) ────────────────────────────
-        # স্মুদিং যত ভালোই হোক, দ্রুত প্যানে উইন্ডো পিছিয়ে পড়ে → বিষয় ফ্রেমের
-        # কিনারায়/বাইরে চলে যায়। তাই প্রতিটি স্যাম্পলে উইন্ডোকে বাধ্যতামূলক
-        # ভাবে কাঙ্ক্ষিত অবস্থানের ±২২% ক্রপ-প্রস্থের ভিতরে রাখি: বিষয় কখনোই
-        # ফ্রেমের বাইরে যেতে পারবে না, কিন্তু নড়াচড়া তখনো মসৃণ থাকে।
-        def contain(sm, tg, crop_sz):
-            lim = 0.22 * crop_sz
-            return [max(t - lim, min(t + lim, s)) for s, t in zip(sm, tg)]
-
-        if track_x:
-            sm_x = contain(sm_x, txs, crop_w)
-        if track_y:
-            sm_y = contain(sm_y, tys, crop_h)
+        sm_x = stabilise(txs, crop_w) if track_x else list(txs)
+        sm_y = stabilise(tys, crop_h) if track_y else list(tys)
 
         def sample_at(track, input_t):
             """Linear interpolation of the 5 Hz track at any input timestamp."""
@@ -1204,7 +1233,8 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         fd, tmp_path = tempfile.mkstemp(prefix="face_cmds_", suffix=".txt")
         with os.fdopen(fd, "w") as f:
             f.write("\n".join(lines) + "\n")
-        print(f"[subject-track] Subject on {found}/{n} samples → crop follows smoothly ({tmp_path})")
+        print(f"[subject-track] Subject on {found}/{n} samples "
+              f"(মোশন-ফলব্যাক {motion_hits[0]}) → crop follows smoothly ({tmp_path})")
         return tmp_path
     except Exception as e:
         print(f"[subject-track] Tracking failed ({e}); keeping static center crop")
