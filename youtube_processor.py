@@ -2267,22 +2267,68 @@ def mix_bgm_on_merged_video(video_path, output_path, bgm_dir="assets/audio", pre
                       "equalizer=f=3000:width_type=h:width=1000:g=2.0,"
                       "asetpts=N/SR/TB,volume=1.35[orig]")
         bgm_vol = os.environ.get("BGM_VOL", "0.28")
-    audio_filter = (f"{orig_chain};[1:a]asetpts=N/SR/TB,volume={bgm_vol}[bgm];"
-                    f"[orig][bgm]amix=inputs=2:duration=first[a]")
+    # ── নাটকের নিজের BGM বাদ (AI সোর্স সেপারেশন) ───────────────────────────
+    # সোর্স ভিডিওর ভেতরে নাটকের নিজের মিউজিক বাঁধা থাকে; ব্যবহারকারী চান শুধু
+    # কণ্ঠ + তাঁর নিজের গান। CLEAN_DIALOGUE=1 হলে Demucs দিয়ে কণ্ঠ আলাদা করে
+    # সেটাই মিক্স করি (না হলে আগের মতোই আসল অডিও)।
+    dlg_in = None
+    dlg_idx = 0
+    _clean_tmp = None
+    try:
+        from dialogue_clean import extract_vocals, enabled as _clean_enabled
+        if _clean_enabled() and not mute_dialogue:
+            print("[clean-dialogue] নাটকের মিউজিক বাদ দিতে কণ্ঠ আলাদা করা হচ্ছে...")
+            _clean_tmp = __import__("tempfile").mkdtemp(prefix="dlg_")
+            dlg_in = extract_vocals(video_path, workdir=_clean_tmp)
+            if dlg_in:
+                dlg_idx = 1  # BGM এর আগে ইনপুট
+    except Exception as _e:
+        print(f"[clean-dialogue] বাদ (উপেক্ষা): {_e}")
+        dlg_in = None
 
-    # High-quality EQ/compression mixing for flawless crystal clear voice
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-stream_loop", "-1", "-ss", "30", "-i", bgm_path,
-        "-filter_complex", audio_filter,
-        "-map", "0:v", "-map", "[a]",
-        "-c:v", "copy", "-c:a", "aac",
-        "-shortest",
-        output_path
-    ]
+    if dlg_in:
+        # আলাদা করা কণ্ঠ থেকে মিক্স (আসল অডিওর নাটক-মিউজিক আর আসে না)
+        if mute_dialogue:
+            orig_chain = f"[{dlg_idx}:a]volume=0[orig]"
+        elif voice_original:
+            orig_chain = (f"[{dlg_idx}:a]aresample=44100,highpass=f=70,"
+                          "lowpass=f=13000,equalizer=f=120:width_type=h:width=50:g=1.0,"
+                          f"asetpts=N/SR/TB,volume={os.environ.get('CLEAN_VOICE_VOL','1.6')}[orig]")
+        else:
+            orig_chain = (f"[{dlg_idx}:a]aresample=44100,highpass=f=150,lowpass=f=6000,"
+                          "equalizer=f=120:width_type=h:width=50:g=2.0,"
+                          f"asetpts=N/SR/TB,volume={os.environ.get('CLEAN_VOICE_VOL','1.8')}[orig]")
+        _bgm_i = dlg_idx + 1
+        audio_filter = (f"{orig_chain};[{_bgm_i}:a]asetpts=N/SR/TB,volume={bgm_vol}[bgm];"
+                        f"[orig][bgm]amix=inputs=2:duration=first[mix];"
+                        "[mix]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=44100[a]")
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-i", dlg_in,
+               "-stream_loop", "-1", "-ss", "30", "-i", bgm_path,
+               "-filter_complex", audio_filter,
+               "-map", "0:v", "-map", "[a]",
+               "-c:v", "copy", "-c:a", "aac", "-shortest", output_path]
+    else:
+        audio_filter = (f"{orig_chain};[1:a]asetpts=N/SR/TB,volume={bgm_vol}[bgm];"
+                        f"[orig][bgm]amix=inputs=2:duration=first[mix];"
+                        "[mix]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=44100[a]")
+
+        # High-quality EQ/compression mixing for flawless crystal clear voice
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-stream_loop", "-1", "-ss", "30", "-i", bgm_path,
+            "-filter_complex", audio_filter,
+            "-map", "0:v", "-map", "[a]",
+            "-c:v", "copy", "-c:a", "aac",
+            "-shortest",
+            output_path
+        ]
     print(f"Mixing BGM on merged video: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        if _clean_tmp:
+            __import__("shutil").rmtree(_clean_tmp, ignore_errors=True)
     return output_path
 
 
