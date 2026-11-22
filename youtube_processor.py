@@ -1213,36 +1213,52 @@ def detect_letterbox(path, samples=(0.15, 0.35, 0.55, 0.75, 0.9), limit=24):
     return f"crop={w}:{h}:{x}:{y},"
 
 
-# ── BGM বাছাই: শুধু লাইসেন্স-নিরাপদ ট্র্যাক ────────────────────────────────
+# ── BGM বাছাই: নিজের গান (own) → CC0 ────────────────────────────
 _CC0_BGM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "assets", "audio", "cc0")
+# নিজের গান/মিউজিক এখানে রাখো — বট এগুলোও BGM হিসেবে মেশাবে
+_OWN_BGM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "assets", "audio", "own")
 
 
 def _bgm_candidates(bgm_dir: str) -> list[str]:
     """
-    CC0 ফোল্ডারে ট্র্যাক থাকলে শুধু সেগুলোই দাও (১০০% কপিরাইট-ফ্রি)।
-    পুরোনো bgm1..4 / bgm_chiro_abhagi-এর লাইসেন্স অজানা → বাদ দেওয়া হয়,
-    নইলে ১০৮০-র "ফ্রি" ভিডিওতেও ক্লেইম আসতে পারে।
+    BGM তালিকা। অগ্রাধিকার: `assets/audio/own/` (নিজের গান) → `cc0/` (কপিরাইট-ফ্রি)।
+
+    .env দিয়ে নিয়ন্ত্রণ:
+        BGM_POOL=own   → শুধু নিজের গান (খালি হলে cc0 fallback)
+        BGM_POOL=cc0   → শুধু কপিরাইট-ফ্রি ট্র্যাক
+        BGM_POOL=mix   → দুটোই মিশিয়ে র‍্যান্ডম
+        (ডিফল্ট: own-এ কিছু থাকলে own, নইলে cc0)
     """
-    def _mp3(d: str) -> list[str]:
+    _bad = {"bgm_combined.mp3"}          # ২১ MB কনক্যাট — BGM হিসেবে অচল
+
+    def _mp3(d: str, allow_legacy: bool = False) -> list[str]:
         if not d or not os.path.isdir(d):
             return []
-        bad = ("bgm_combined.mp3", "bgm_chiro_abhagi.mp3")
         out = []
         for f in sorted(os.listdir(d)):
             if not f.lower().endswith((".mp3", ".wav", ".m4a", ".ogg")):
                 continue
-            if f in bad or f.startswith("outro_") or f.startswith("bgm_") and f.endswith("_abhagi.mp3"):
+            if f in _bad or f.startswith("outro_"):
                 continue
-            if os.path.basename(d) != "cc0" and (f in ("bgm1.mp3", "bgm2.mp3", "bgm3.mp3", "bgm4.mp3")):
+            # cc0 ছাড়া অন্য ফোল্ডারে পুরোনো bgm1..4 বাদ (লাইসেন্স অজানা)
+            if not allow_legacy and f in ("bgm1.mp3", "bgm2.mp3", "bgm3.mp3", "bgm4.mp3"):
                 continue
             out.append(os.path.join(d, f))
         return out
 
+    own = _mp3(_OWN_BGM_DIR, allow_legacy=True)
     cc0 = _mp3(_CC0_BGM_DIR)
-    if cc0:
-        return cc0
-    return _mp3(bgm_dir)
+    mode = os.environ.get("BGM_POOL", "").strip().lower()
+    if mode == "cc0":
+        return cc0 or own
+    if mode == "mix":
+        return (own + cc0) or _mp3(bgm_dir, allow_legacy=True)
+    if mode == "own":
+        return own or cc0
+    # ডিফল্ট: নিজের গান থাকলে সেটাই, নইলে কপিরাইট-ফ্রি
+    return own if own else (cc0 or _mp3(bgm_dir, allow_legacy=True))
 
 def ensure_cookies(path: str = "cookies.txt") -> bool:
     """

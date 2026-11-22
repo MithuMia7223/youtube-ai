@@ -269,7 +269,7 @@ def main() -> int:
     # ── ২) প্রসেসিং (বার-মুক্ত, ১০৮০) ───────────────────────────────────
     log(f"[2/3] প্রসেসিং — {mode} (বার-মুক্ত ১০৮০) …")
     yp.process_clip_copyright_bypass(str(raw), str(final), is_short=is_short,
-                                     bgm_dir=str(ROOT / "assets" / "audio" / "cc0"), mix_bgm=False)
+                                     bgm_dir=str(ROOT / "assets" / "audio"), mix_bgm=False)
 
     # ── BGM (বটের মতো) ──────────────────────────────────────────────────
     if want_bgm and want_free:
@@ -292,7 +292,7 @@ def main() -> int:
         try:
             log("[2b] BGM মিক্স করা হচ্ছে …")
             yp.mix_bgm_on_merged_video(str(final), str(bgm_out),
-                                       bgm_dir=str(ROOT / "assets" / "audio" / "cc0"))
+                                       bgm_dir=str(ROOT / "assets" / "audio"))
             if bgm_out.exists() and bgm_out.stat().st_size > 10_000:
                 bgm_out.replace(final)
                 ok = True
