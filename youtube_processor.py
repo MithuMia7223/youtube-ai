@@ -954,6 +954,8 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         prev_gray_ref = [None]   # মোশন ফলব্যাকের জন্য আগের ফ্রেম (grayscale)
         motion_hits = [0]        # কত ফ্রেমে মোশন-ফলব্যাক ব্যবহার হয়েছে
         cut_count = [0]          # কতগুলো শট-কাট ধরা পড়েছে
+        motion_hist = [[]]       # মোশন-ফলব্যাকের সাম্প্রতিক কেন্দ্র (স্থিরতা যাচাই)
+        motion_streak = [0]      # টানা কত ফ্রেম একই জায়গায় নড়াচড়া
 
         def pick(candidates, prev):
             """
@@ -1049,9 +1051,26 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                                 (c[1] + c[3] / 2) / sample_h - prev_c[1]))
                         else:
                             cand.sort(key=lambda c: -c[2] * c[3])
-                        box = (float(cand[0][0]), float(cand[0][1]),
-                               float(cand[0][2]), float(cand[0][3]), False)
-                        motion_hits[0] += 1
+                        bx0, by0, bw0, bh0 = cand[0]
+                        mcx = (bx0 + bw0 / 2) / sample_w
+                        mcy = (by0 + bh0 / 2) / sample_h
+                        # স্থিরতা যাচাই: টানা ৩ ফ্রেম একই জায়গার (±১০%) নড়াচড়া
+                        # তবেই গ্রহণ — এক-ফ্রেমের র‍্যান্ডম টুকরা (পাখি, চারা, তালু)
+                        # ক্রপ লাফায় না। মানুষ হারিয়ে গেলে ক্রপ শেষ অবস্থানে থাকে,
+                        # যা লাফানোর চেয়ে অনেক ভালো দেখায়।
+                        if (motion_hist[0] and
+                                math.hypot(mcx - motion_hist[0][-1][0],
+                                           mcy - motion_hist[0][-1][1]) < 0.10):
+                            motion_streak[0] += 1
+                        else:
+                            motion_streak[0] = 1
+                        motion_hist[0].append((mcx, mcy))
+                        if len(motion_hist[0]) > 3:
+                            motion_hist[0].pop(0)
+                        if motion_streak[0] >= 3:
+                            box = (float(bx0), float(by0),
+                                   float(bw0), float(bh0), False)
+                            motion_hits[0] += 1
                 except Exception:
                     pass
             # ── নাটকের "কাট" (shot change) সনাক্ত → নতুন শটে নতুন করে লক ────
