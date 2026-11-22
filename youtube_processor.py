@@ -1385,7 +1385,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         else:
             pitch_factor = random.uniform(0.82, 0.87)  # Deep-pitched AI voice filter
         tempo_factor = speed_factor / pitch_factor
-        _pitch_part = f"asetrate=44100*{pitch_factor:.4f},aresample=44100,"
+        _pitch_part = f"{_pitch_part}"
 
     # ── Face tracking: build a sendcmd file so the crop window follows the face ──
     # শুধু শর্টস-চেইনে ফেস-ক্রপ ব্যবহার হয়। লং-ফর্ম এখন ফুল-ব্লিড cover-crop করে,
@@ -1775,7 +1775,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"[{main_idx}:a]afftdn=noise_reduction=10,aresample=44100,"
                 f"highpass=f=200,lowpass=f=3500,"
                 f"equalizer=f=120:width_type=h:width=50:g=2.0,equalizer=f=3000:width_type=h:width=1000:g=2.0,"
-                f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,asetrate=44100*{pitch_factor:.4f},aresample=44100,"
+                f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,{_pitch_part}"
                 f"asetpts=N/SR/TB,atempo={tempo_factor:.4f},volume=1.35"
             )
             bgm_vol_val = 0.28
@@ -1784,7 +1784,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"[{main_idx}:a]afftdn=noise_reduction=10,aresample=44100,"
                 f"highpass=f=200,lowpass=f=3500,"
                 f"equalizer=f=120:width_type=h:width=50:g=2.0,equalizer=f=3000:width_type=h:width=1000:g=2.0,"
-                f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,asetrate=44100*{pitch_factor:.4f},aresample=44100,"
+                f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,{_pitch_part}"
                 f"asetpts=N/SR/TB,atempo={tempo_factor:.4f},volume=1.35"
             )
             bgm_vol_val = 0.28
