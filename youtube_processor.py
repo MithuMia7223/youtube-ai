@@ -1482,9 +1482,12 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         _m2 = __import__("re").search(r"Video:.*?, (\d+)x(\d+)", _e2)
         if _m2:
             _iw, _ih = int(_m2.group(1)), int(_m2.group(2))
-            if (_iw, _ih) in ((1080, 1080), (1920, 1080), (_LW, _LH)):
+            if (_iw, _ih) == (_LW, _LH):
+                # শুধু তখনই বাদ, যখন ইনপুটই ঠিক আউটপুট সাইজ (স্টক ভিডিও)।
+                # ১৯২০×১০৮০ উৎসে পোড়া বার থাকলে সেটা কাটতেই হবে, নইলে
+                # ১:১ ক্রপের উপরে-নিচে কালো বার থেকে যায়।
                 _skip_bars = True
-                print(f"[letterbox] ইনপুট {_iw}×{_ih} ইতিমধ্যে টার্গেট — বার-সনাক্তকরণ বাদ")
+                print(f"[letterbox] ইনপুট {_iw}×{_ih} = আউটপুট সাইজ — বার-সনাক্তকরণ বাদ")
     except Exception:
         pass
     try:
