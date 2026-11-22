@@ -944,6 +944,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         tiny = 0           # কত ফ্রেম ধরে বিষয় অন্য মুখের তুলনায় অনেক ছোট
         prev_gray_ref = [None]   # মোশন ফলব্যাকের জন্য আগের ফ্রেম (grayscale)
         motion_hits = [0]        # কত ফ্রেমে মোশন-ফলব্যাক ব্যবহার হয়েছে
+        cut_count = [0]          # কতগুলো শট-কাট ধরা পড়েছে
 
         def pick(candidates, prev):
             """
@@ -1038,6 +1039,18 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                         box = (float(cand[0][0]), float(cand[0][1]),
                                float(cand[0][2]), float(cand[0][3]), False)
                         motion_hits[0] += 1
+                except Exception:
+                    pass
+            # ── নাটকের "কাট" (shot change) সনাক্ত → নতুন শটে নতুন করে লক ────
+            # প্রতিটি শটে মানুষ আলাদা জায়গায়। কাট না ধরলে আগের শটের অবস্থানে
+            # ক্রপ আটকে থাকে → নতুন শটের মানুষ কাটা পড়ে ("প্রতিটা কাটে ঠিক করো")।
+            if prev_gray_ref[0] is not None:
+                try:
+                    _dd = cv2.absdiff(gray, prev_gray_ref[0])
+                    if float(np.percentile(_dd, 50)) > 16.0:      # ধারালো দৃশ্য বদল
+                        prev_c, prev_size, vel = None, 0.0, [0.0, 0.0]
+                        misses = 0
+                        cut_count[0] += 1
                 except Exception:
                     pass
             prev_gray_ref[0] = gray
@@ -1185,11 +1198,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             for tgt in track:
                 err = tgt - pos
                 if abs(err) > crop_sz * 0.35:
-                    # দৃশ্য বদল: আগে এক ফ্রেমে লাফ দিত (২৫০–৩০০px টেলিপোর্ট)।
-                    # এখন ০.৬ ক্রপ/সেকেন্ডে দ্রুত কিন্তু মসৃণ গ্লাইড — চোখে লাগে না।
-                    cap0 = crop_sz * 0.6 * dt
-                    pos += max(-cap0, min(cap0, err))
-                    moving = False
+                    # দৃশ্য বদল → সাথে সাথে বসাই। (০.৬ ক্রপ/সেকেন্ডের "গ্লাইড"
+                    # চেষ্টা করেছিলাম — তাতে কয়েক ফ্রেম বিষয় কিনারায় গিয়ে
+                    # **কাটা পড়ত**। ব্যবহারকারীর রিপোর্ট: "কাটে কাটে দেখা যাচ্ছে"।)
+                    pos, moving = tgt, False
                     out.append(pos)
                     continue
                 if not moving and abs(err) > idle_zone:
@@ -1201,7 +1213,8 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                     cap = (fast if abs(err) > crop_sz * 0.25 else slow) * dt
                     pos += max(-cap, min(cap, step))
                 out.append(pos)
-            lim = crop_sz * 0.25
+            # বিষয় সবসময় ফ্রেমের ৩৫–৬৫% এর ভিতরে → কাটার সুযোগ নেই
+            lim = crop_sz * 0.15
             return [max(tgt - lim, min(tgt + lim, s)) for s, tgt in zip(out, track)]
 
         sm_x = stabilise(txs, crop_w) if track_x else list(txs)
@@ -1243,7 +1256,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         with os.fdopen(fd, "w") as f:
             f.write("\n".join(lines) + "\n")
         print(f"[subject-track] Subject on {found}/{n} samples "
-              f"(মোশন-ফলব্যাক {motion_hits[0]}) → crop follows smoothly ({tmp_path})")
+              f"(মোশন-ফলব্যাক {motion_hits[0]} · শট-কাট {cut_count[0]}) → crop follows smoothly ({tmp_path})")
         return tmp_path
     except Exception as e:
         print(f"[subject-track] Tracking failed ({e}); keeping static center crop")
