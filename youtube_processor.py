@@ -1122,14 +1122,19 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # ── Outlier rejection ─────────────────────────────────────────────
         # A single bad detection (motion blur, a hand in front of the face)
         # would otherwise drag the whole smoothing filter off for ~1 s.
-        def median3(seq):
+        def median5(seq):
+            """৫-ট্যাপ মিডিয়ান (০.৪s): ডিটেকশনের এক-ফ্রেম শব্দ (হাত, ব্লার) মুছে
+            দেয় — শব্দ থাকলে ক্যামেরা অকারণে এক-দুই পিক্সেল নড়ে ("নরচরা")।"""
             out = list(seq)
-            for i in range(1, len(seq) - 1):
-                out[i] = sorted((seq[i - 1], seq[i], seq[i + 1]))[1]
+            half = 2
+            for i in range(len(seq)):
+                lo = max(0, i - half)
+                hi = min(len(seq), i + half + 1)
+                out[i] = sorted(seq[lo:hi])[len(seq[lo:hi]) // 2]
             return out
 
-        rel_x = median3(rel_x)
-        rel_y = median3(rel_y)
+        rel_x = median5(rel_x)
+        rel_y = median5(rel_y)
 
         # Desired crop offsets in the *cropped* frame's pixels, for every sample
         face_y_frac = 0.50   # v1-এর মতো ঠিক মাঝখানে
@@ -1171,7 +1176,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             সারাক্ষণ গড়িয়ে চলার বদলে।
             """
             dt = 1.0 / sample_fps
-            idle_zone = crop_sz * 0.10   # ১৫% → ১০%: বিষয় আরো মাঝখানে      # এর ভিতরে থাকলে স্থির
+            idle_zone = crop_sz * 0.08   # ১৫% → ১০%: বিষয় আরো মাঝখানে      # এর ভিতরে থাকলে স্থির
             settle = crop_sz * 0.025         # এত কাছে এলে থেমে যাই
             slow = crop_sz * 0.10           # px/সেকেন্ড — মসৃণ প্যান
             fast = crop_sz * 0.50           # px/সেকেন্ড — হারিয়ে যাচ্ছে
@@ -1179,8 +1184,12 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             pos, moving, out = track[0], False, []
             for tgt in track:
                 err = tgt - pos
-                if abs(err) > crop_sz * 0.35:      # দৃশ্য বদল → সাথে সাথে
-                    pos, moving = tgt, False
+                if abs(err) > crop_sz * 0.35:
+                    # দৃশ্য বদল: আগে এক ফ্রেমে লাফ দিত (২৫০–৩০০px টেলিপোর্ট)।
+                    # এখন ০.৬ ক্রপ/সেকেন্ডে দ্রুত কিন্তু মসৃণ গ্লাইড — চোখে লাগে না।
+                    cap0 = crop_sz * 0.6 * dt
+                    pos += max(-cap0, min(cap0, err))
+                    moving = False
                     out.append(pos)
                     continue
                 if not moving and abs(err) > idle_zone:
