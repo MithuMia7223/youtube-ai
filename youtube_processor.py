@@ -1323,7 +1323,13 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     8. Prepend thumbnail image as first 1.5s of the video (optional).
     """
     set_ffmpeg_path()
-    
+
+    # ── আউটপুট সেটিংস: ১:১ স্কয়ার · ১০৮০ · অরিজিনাল কণ্ঠ ────────────────
+    # FORCE_SQUARE=1 (ডিফল্ট): লং ভিডিওও ১:১ (১০৮০×১০৮০) ক্রপ হবে
+    # VOICE_ORIGINAL=1 (ডিফল্ট): শিল্পীর নিজের কণ্ঠ অটুট — পিচ বদলাবে না (AI ভয়েস নয়)
+    sq = bool(is_short) or os.environ.get("FORCE_SQUARE", "1") != "0"
+    voice_original = os.environ.get("VOICE_ORIGINAL", "1") != "0"
+
     f_bangla = get_best_font_path("bangla")
     f_english = get_best_font_path("english")
     watermark_text = os.environ.get("WATERMARK_TEXT", "Tawhidul official")
@@ -1350,20 +1356,28 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     # Randomize bypass factors for 0% copyright matching (changes fingerprint hash on every single run)
     # Using subtle pitch shift for both shorts and long videos to maintain crystal clear voice quality
     speed_factor = random.uniform(1.045, 1.055)
-    # Modified AI Voice Changer Filter (shifts pitch up or down distinctly to change vocal timber)
-    if random.choice([True, False]):
-        pitch_factor = random.uniform(1.12, 1.18)  # High-pitched AI voice filter
+    if voice_original:
+        # নিজের কণ্ঠ অটুট: পিচ-শিফট নেই, শুধু সামান্য গতি (atempo পিচ ঠিক রাখে)
+        pitch_factor = 1.0
+        tempo_factor = speed_factor
+        _pitch_part = ""          # asetrate বাদ → কণ্ঠ যেমন ছিল তেমনই
+        print(f"[voice] অরিজিনাল কণ্ঠ — পিচ অটুট, গতি {speed_factor:.3f}× (tempo {tempo_factor:.3f})")
     else:
-        pitch_factor = random.uniform(0.82, 0.87)  # Deep-pitched AI voice filter
-    tempo_factor = speed_factor / pitch_factor
+        # Modified AI Voice Changer Filter (shifts pitch up or down distinctly to change vocal timber)
+        if random.choice([True, False]):
+            pitch_factor = random.uniform(1.12, 1.18)  # High-pitched AI voice filter
+        else:
+            pitch_factor = random.uniform(0.82, 0.87)  # Deep-pitched AI voice filter
+        tempo_factor = speed_factor / pitch_factor
+        _pitch_part = f"asetrate=44100*{pitch_factor:.4f},aresample=44100,"
 
     # ── Face tracking: build a sendcmd file so the crop window follows the face ──
     # শুধু শর্টস-চেইনে ফেস-ক্রপ ব্যবহার হয়। লং-ফর্ম এখন ফুল-ব্লিড cover-crop করে,
     # তাই ওখানে sendcmd লাগে না। আগে সব ভিডিওতে ৫ fps-এ YuNet/Haar চলত →
     # ৩০ মিনিটের লং ভিডিওতে হাজার হাজার ফ্রেম বিশ্লেষণ = পুরো সময়ের বড় অংশ নষ্ট।
     face_cmd_file = compute_face_sendcmd_file(
-        input_path, speed_factor, is_short,
-        sample_fps=12.0 if is_short else 10.0,
+        input_path, speed_factor, sq,
+        sample_fps=12.0 if sq else 5.0,
     )
     face_cmd_prefix = f"sendcmd=f='{face_cmd_file}'," if face_cmd_file else ""
     
@@ -1398,16 +1412,16 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     
     title_overlay = ""
     if display_title:
-        if is_short:
+        if sq:
             # Clean static text overlay in greenyellow color
             title_overlay = f",drawtext=text='{display_title}':x=(w-tw)/2:y=240:fontsize=96:fontcolor=greenyellow:bordercolor=black:borderw=8:fontfile='{f_bangla}'"
         else:
             # Keep yellow title bar only for long compilation videos
             title_overlay = f",drawtext=text='{display_title}':x=(w-tw)/2:y=h-160:fontsize=90:fontcolor=yellow:bordercolor=black:borderw=6:fontfile='{f_bangla}'"
-    # Generate snow overlay if is_short
+    # Generate snow overlay if sq
     has_snow = False
     snow_path = None
-    if is_short:
+    if sq:
         try:
             snow_path = ensure_snow_overlay()
             if snow_path and os.path.exists(snow_path):
@@ -1425,10 +1439,10 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
     # আউটপুটের DAR জোর করে ঠিক রাখি — উৎসের অদ্ভুত SAR (যেমন 256:81) ক্যারি হয়ে
     # ফাইলটা 1080x1920 হয়েও 16:9 দেখালে মোবাইল প্লেয়ার বার বসিয়ে স্কেল করে।
     # শর্টস এখন ১:১ স্কয়ার (বার-মুক্ত, ফুল-ব্লিড)
-    _ASPECT = "1:1" if is_short else "16:9"
+    _ASPECT = "1:1" if sq else "16:9"
     # লং-ফর্ম আগে জোর করে 4K (3840x2160) বানাত → মোবাইলে ৪ গুণ পিক্সেল ডিকোড,
     # ব্যাটারি/হিট/ল্যাগ। এখন ডিফল্ট 1080p; দরকার হলে KEEP_4K=1 দিয়ে 4K।
-    if is_short:
+    if sq:
         _LW, _LH = 1080, 1080
     elif os.environ.get("KEEP_4K", "0") == "1":
         _LW, _LH = 3840, 2160
@@ -1553,22 +1567,23 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         parts = []
 
         # ── Thumbnail video ─────────────────────────────────────────────────
-        if is_short:
-            parts.append(f"[{thumb_idx}:v]scale=1080:1920,setsar=1[v_t]")
+        if sq:
+            parts.append(f"[{thumb_idx}:v]scale=1080:1080:force_original_aspect_ratio=decrease,"
+                         f"pad=1080:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v_t]")
         else:
             parts.append(f"[{thumb_idx}:v]scale={_LONG},setsar=1[v_t]")
 
         # Thumbnail silent audio (1.5 s, stereo 44100 Hz)
         parts.append("aevalsrc=0:c=stereo:s=44100:d=1.5[a_t]")
 
-        avatar_sz = 220 if is_short else 300
+        avatar_sz = 220 if sq else 300
         # ── Main video ──────────────────────────────────────────────────────
-        if is_short:
+        if sq:
             v_main = (
                 f"[{main_idx}:v]{bars_prefix}hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"{_up_sharp}unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
-                f"{track_crop_chain(face_cmd_prefix, is_short=True)},{beauty_filter()}"
+                f"{track_crop_chain(face_cmd_prefix, is_short=sq)},{beauty_filter()}"
                 f"{title_overlay}[v_main_raw]"
             )
             parts.append(v_main)
@@ -1578,7 +1593,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"[{main_idx}:v]{bars_prefix}hflip,{_up_sharp}unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"setpts=PTS/{speed_factor:.4f},"
-                f"{track_crop_chain(face_cmd_prefix, is_short=False, out_w=_LW, out_h=_LH)},"
+                f"{track_crop_chain(face_cmd_prefix, is_short=sq, out_w=_LW, out_h=_LH)},"
                 f"{beauty_filter()},"
                 f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
                 f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
@@ -1589,20 +1604,20 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         if has_avatar and os.environ.get("SHOW_AVATAR", "0") == "1":
             r = avatar_sz // 2
             parts.append(f"[{avatar_idx}:v]scale={avatar_sz}:{avatar_sz},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-{r},Y-{r}),{r}),255,0)'[avatar_round]")
-            pad = 60 if is_short else 100
+            pad = 60 if sq else 100
             parts.append(f"{v_main_name}[avatar_round]overlay=x={pad}:y={pad}[v_main_p]")
         else:
             parts.append(f"{v_main_name}format=yuv420p[v_main_p]")
 
         # ── Main audio (Crystal clear AI/Studio voice with background noise cancellation) ─────────────────
-        if is_short:
+        if sq:
             audio_eq = (
                 f"[{main_idx}:a]afftdn=noise_reduction=10,aresample=44100,"
                 f"highpass=f=200,lowpass=f=3500,"
                 f"equalizer=f=120:width_type=h:width=50:g=2.0,"
                 f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
                 f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
-                f"asetrate=44100*{pitch_factor:.4f},aresample=44100,asetpts=N/SR/TB,"
+                f"{_pitch_part}asetpts=N/SR/TB,"
                 f"atempo={tempo_factor:.4f},volume=1.35"
             )
             bgm_vol_val = 0.28
@@ -1614,7 +1629,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"equalizer=f=120:width_type=h:width=50:g=2.0,"
                 f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
                 f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
-                f"asetrate=44100*{pitch_factor:.4f},aresample=44100,asetpts=N/SR/TB,"
+                f"{_pitch_part}asetpts=N/SR/TB,"
                 f"atempo={tempo_factor:.4f},volume=1.35"
             )
             bgm_vol_val = 0.28
@@ -1635,7 +1650,8 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 parts.append(f"[{narration_idx}:a]asetpts=N/SR/TB,volume=1.5[narr_vol]")
                 # amix-এ উৎস রাখতেই হয় (নইলে [a_eq] আউটপুট unconnected → ffmpeg এরর),
                 # কিন্তু ভলিউম ০ হলে কিছু শোনা যায় না → "extra voice" আর নেই।
-                _orig_vol = float(os.environ.get("KEEP_ORIG_AUDIO_VOL", "0") or 0)
+                _orig_vol = float(os.environ.get(
+                    "KEEP_ORIG_AUDIO_VOL", "0.95" if voice_original else "0") or 0)
                 parts.append(f"{current_dialogue}volume={_orig_vol}[orig_bg]")
                 parts.append(f"[orig_bg][narr_vol]amix=inputs=2:duration=first:normalize=0[diag_narr]")
                 current_dialogue = "[diag_narr]"
@@ -1662,8 +1678,8 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         v_main_final = "[v_main_p]"
         if srt_path and os.path.exists(srt_path):
             escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-            margin = 200 if is_short else 80
-            font_sz = 64 if is_short else 24
+            margin = 200 if sq else 80
+            font_sz = 64 if sq else 24
             sub_filter = f"[v_main_p]subtitles='{escaped_srt}':force_style='Alignment=2,MarginV={margin},OutlineColour=&H000000,BorderStyle=3,Outline=3,Shadow=0,Fontname=Arial,Fontsize={font_sz},PrimaryColour=&H00FFFF'[v_main_sub]"
             parts.append(sub_filter)
             v_main_final = "[v_main_sub]"
@@ -1690,16 +1706,16 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         if has_thumb:
             return build_filter_with_thumb(enc, enc_args)
 
-        avatar_sz = 220 if is_short else 300
+        avatar_sz = 220 if sq else 300
         # ── No-thumbnail path (unchanged logic) ────────────────────────────
         # v_filter / a_filter are only used here
         vf_parts = []
-        if is_short:
+        if sq:
             v_main = (
                 f"[{main_idx}:v]{bars_prefix}hflip,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"{_up_sharp}unsharp=7:7:1.2:7:7:1.2,setpts=PTS/{speed_factor:.4f},"
-                f"{track_crop_chain(face_cmd_prefix, is_short=True)},{beauty_filter()}"
+                f"{track_crop_chain(face_cmd_prefix, is_short=sq)},{beauty_filter()}"
                 f"{title_overlay}"
             )
         else:
@@ -1708,7 +1724,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"[{main_idx}:v]{bars_prefix}hflip,{_up_sharp}unsharp=7:7:1.2:7:7:1.2,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"setpts=PTS/{speed_factor:.4f},"
-                f"{track_crop_chain(face_cmd_prefix, is_short=False, out_w=_LW, out_h=_LH)},"
+                f"{track_crop_chain(face_cmd_prefix, is_short=sq, out_w=_LW, out_h=_LH)},"
                 f"{beauty_filter()},"
                 f"drawtext=text='{watermark_text}':x=200:y=h-260:fontsize=68:fontcolor=white:bordercolor=black:borderw=5:fontfile='{f_english}',"
                 f"drawtext=text='On My YouTube Channel':x=200:y=h-180:fontsize=44:fontcolor=yellow:bordercolor=black:borderw=4:fontfile='{f_english}'"
@@ -1720,7 +1736,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
         
         if has_avatar and os.environ.get("SHOW_AVATAR", "0") == "1":
             r = avatar_sz // 2
-            pad = 60 if is_short else 100
+            pad = 60 if sq else 100
             vf_parts.append(f"[{avatar_idx}:v]scale={avatar_sz}:{avatar_sz},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-{r},Y-{r}),{r}),255,0)'[avatar_round]")
             vf_parts.append(f"{current_v}[avatar_round]overlay=x={pad}:y={pad}[v_avatar]")
             current_v = "[v_avatar]"
@@ -1730,12 +1746,12 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
 
         if srt_path and os.path.exists(srt_path):
             escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-            margin = 600 if is_short else 80
-            font_sz = 64 if is_short else 24
+            margin = 600 if sq else 80
+            font_sz = 64 if sq else 24
             no_thumb_vf = no_thumb_vf.replace("[v]", "[v_nosub]")
             no_thumb_vf += f"; [v_nosub]subtitles='{escaped_srt}':force_style='Alignment=2,MarginV={margin},OutlineColour=&H000000,BorderStyle=3,Outline=3,Shadow=0,Fontname=Arial,Fontsize={font_sz},PrimaryColour=&H00FFFF'[v]"
 
-        if is_short:
+        if sq:
             audio_eq_no_thumb = (
                 f"[{main_idx}:a]afftdn=noise_reduction=10,aresample=44100,"
                 f"highpass=f=200,lowpass=f=3500,"
@@ -1835,10 +1851,10 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
 
     def build_command_bare(enc, enc_args):
         """Absolute minimum fallback: just speed + flip, no BGM, no thumb."""
-        if is_short:
+        if sq:
             v_f = (
                 f"[0:v]hflip,setpts=PTS/{speed_factor:.4f},"
-                f"{track_crop_chain(face_cmd_prefix, is_short=True)},{beauty_filter()}[v]"
+                f"{track_crop_chain(face_cmd_prefix, is_short=sq)},{beauty_filter()}[v]"
             )
         else:
             # High-level copyright bypass visual canvas layout for long compilation videos (4K HD output with face correction, static stable rendering)
@@ -1846,20 +1862,20 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                 f"[0:v]hflip,unsharp=5:5:0.8:5:5:0.8,eq=contrast={rand_contrast}:brightness={rand_brightness}:saturation={rand_saturation},"
                 f"hue=h=-6:s=1.08,colorbalance=rs={rand_rs}:gs={rand_gs}:bs={rand_bs}:rm={rand_rm}:gm={rand_gm}:bm={rand_bm}:rh={rand_rh}:gh={rand_gh}:bh={rand_bh},"
                 f"setpts=PTS/{speed_factor:.4f},"
-                f"{track_crop_chain(face_cmd_prefix, is_short=False, out_w=_LW, out_h=_LH)},"
+                f"{track_crop_chain(face_cmd_prefix, is_short=sq, out_w=_LW, out_h=_LH)},"
                 f"{beauty_filter()}[v]"
             )
 
         cmd = ["ffmpeg", "-y", "-threads", "0",
                "-i", input_path]
         if has_audio:
-            if is_short:
+            if sq:
                 a_f_bare = (
                     f"[0:a]afftdn=noise_reduction=10,aresample=44100,"
                     f"equalizer=f=120:width_type=h:width=50:g=2.0,"
                     f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
                     f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
-                    f"asetrate=44100*{pitch_factor:.4f},aresample=44100,asetpts=N/SR/TB,"
+                    f"{_pitch_part}asetpts=N/SR/TB,"
                     f"atempo={tempo_factor:.4f},volume=1.20[a]"
                 )
             else:
@@ -1868,7 +1884,7 @@ def process_clip_copyright_bypass(input_path, output_path, is_short=False, bgm_d
                     f"equalizer=f=120:width_type=h:width=50:g=2.0,"
                     f"equalizer=f=3000:width_type=h:width=1000:g=2.0,"
                     f"acompressor=threshold=-15dB:ratio=3:attack=5:release=50,"
-                    f"asetrate=44100*{pitch_factor:.4f},aresample=44100,asetpts=N/SR/TB,"
+                    f"{_pitch_part}asetpts=N/SR/TB,"
                     f"atempo={tempo_factor:.4f},volume=1.20[a]"
                 )
             cmd += ["-filter_complex", f"{v_f};{a_f_bare}", "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-movflags", "+faststart", "-aspect", _ASPECT]
@@ -2092,12 +2108,29 @@ def mix_bgm_on_merged_video(video_path, output_path, bgm_dir="assets/audio", pre
         shutil.copy(video_path, output_path)
         return output_path
         
+    # ── অরিজিনাল কণ্ঠ অটুট: হালকা ইকিউ (২০০–৩৫০০ Hz ব্যান্ড-পাস কণ্ঠকে "টেলিফোন"
+    #    করে ফেলে) আর BGM আরো নিচে — যাতে শিল্পীর নিজের কথা স্পষ্ট শোনা যায়।
+    voice_original = os.environ.get("VOICE_ORIGINAL", "1") != "0"
+    if voice_original:
+        orig_chain = ("[0:a]afftdn=noise_reduction=6,aresample=44100,highpass=f=80,"
+                      "lowpass=f=11000,equalizer=f=120:width_type=h:width=50:g=1.0,"
+                      "asetpts=N/SR/TB,volume=1.15[orig]")
+        bgm_vol = os.environ.get("BGM_VOL", "0.15")
+    else:
+        orig_chain = ("[0:a]afftdn=noise_reduction=10,aresample=44100,highpass=f=200,"
+                      "lowpass=f=3500,equalizer=f=120:width_type=h:width=50:g=2.0,"
+                      "equalizer=f=3000:width_type=h:width=1000:g=2.0,"
+                      "asetpts=N/SR/TB,volume=1.35[orig]")
+        bgm_vol = os.environ.get("BGM_VOL", "0.28")
+    audio_filter = (f"{orig_chain};[1:a]asetpts=N/SR/TB,volume={bgm_vol}[bgm];"
+                    f"[orig][bgm]amix=inputs=2:duration=first[a]")
+
     # High-quality EQ/compression mixing for flawless crystal clear voice
     cmd = [
         "ffmpeg", "-y",
         "-i", video_path,
         "-stream_loop", "-1", "-ss", "30", "-i", bgm_path,
-        "-filter_complex", "[0:a]afftdn=noise_reduction=10,aresample=44100,highpass=f=200,lowpass=f=3500,equalizer=f=120:width_type=h:width=50:g=2.0,equalizer=f=3000:width_type=h:width=1000:g=2.0,asetpts=N/SR/TB,volume=1.35[orig];[1:a]asetpts=N/SR/TB,volume=0.28[bgm];[orig][bgm]amix=inputs=2:duration=first[a]",
+        "-filter_complex", audio_filter,
         "-map", "0:v", "-map", "[a]",
         "-c:v", "copy", "-c:a", "aac",
         "-shortest",

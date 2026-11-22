@@ -1871,7 +1871,8 @@ def _run_youtube_pipeline_auto(chat_id: int, url: str, is_short: bool, original_
                 
                 # Generate AI narration voiceover audio if narration text is provided
                 narration_path = None
-                if narration_text:
+                # অরিজিনাল কণ্ঠ ডিফল্ট: AI কমেন্ট্রি বন্ধ (চাইলে AI_NARRATION=1)
+                if narration_text and os.environ.get("AI_NARRATION", "0") == "1":
                     bot.send_message(chat_id, f"🎙️ [দৃশ্য {idx+1}] এআই কমেন্ট্রি ভয়েস তৈরি হচ্ছে: \"{narration_text}\"...")
                     try:
                         from video_creator import _generate_audio
