@@ -955,6 +955,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         motion_hits = [0]        # কত ফ্রেমে মোশন-ফলব্যাক ব্যবহার হয়েছে
         cut_count = [0]          # কতগুলো শট-কাট ধরা পড়েছে
         motion_hist = [[]]       # মোশন-ফলব্যাকের সাম্প্রতিক কেন্দ্র (স্থিরতা যাচাই)
+        no_face_run = [0]        # টানা কত ফ্রেম কোনো মুখ/শরীর পাওয়া যায়নি
         motion_streak = [0]      # টানা কত ফ্রেম একই জায়গায় নড়াচড়া
 
         def pick(candidates, prev):
@@ -1028,6 +1029,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             # অভিযোগ: "মাঝে মাঝে ট্র্যাকিং হয় না")। এখন ফ্রেম-পার্থক্য দিয়ে
             # যেখানে নড়াচড়া হচ্ছে সেটাই ধরি — পুরো ফ্রেম নড়লে (ক্যামেরা প্যান)
             # সেটা বাদ দিই, কারণ তখন ক্রপ নিজেই ঠিক থাকে।
+            if box is None:
+                no_face_run[0] += 1
+            else:
+                no_face_run[0] = 0
             if box is None and prev_gray_ref[0] is not None:
                 try:
                     d = cv2.absdiff(gray, prev_gray_ref[0])
@@ -1044,6 +1049,11 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                     # বিষয় থাকে না — বড় জোন (২৫%+) বাদ দিই; সব বাদ পড়লে
                     # ক্রপ শেষ অবস্থানেই স্থির থাকে (টাইটেলে ক্যামেরা ঘোরানো ঠিক নয়)।
                     cand = [c for c in cand if c[2] * c[3] < 0.25 * sample_w * sample_h]
+                    # টানা অনেকক্ষণ কোনো মুখ/শরীর না পাওয়া গেলে (নাটক শেষ →
+                    # গ্রাফিক/টাইটেল জোন) মোশন-ফলব্যাক পুরোপুরি বন্ধ — গ্রাফিকের
+                    # ফ্ল্যাশ/স্ফুলিংকে ধরে ক্যামেরা আর লাফাবে না (শেষদিকের শেক)।
+                    if no_face_run[0] > sample_fps * 2.0:
+                        cand = []
                     if cand:
                         if prev_c is not None:
                             cand.sort(key=lambda c: math.hypot(
@@ -1195,6 +1205,28 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             )
 
         txs, tys = zip(*[targets(x, y) for x, y in zip(rel_x, rel_y)])
+
+        # ── প্যান-শট গার্ড ────────────────────────────────────────────────
+        # নাটকের শেষ শটে প্রায়ই ক্যামেরা নিজেই দুই কিনারায় প্যান করে (মানুষ
+        # ফ্রেমজুড়ে হাঁটে)। তখন টার্গেট ০ ↔ (eff_w − crop_w) পুরো রেঞ্জে ছুটে
+        # যায় → ক্রপ প্রতি সেকেন্ডে ৩০০–৪০০px নড়ে ("শেষদিকে বেশি নরচরা")।
+        # কোনো অংশে টার্গেট এক সেকেন্ডে ২০% ক্রপ-প্রস্থের বেশি দৌড়ালে সেই
+        # অংশ জমে যায় (শেষ স্থান ধরে রাখি) — স্থির ফ্রেম অগোছালো প্যানের চেয়ে ভালো।
+        def freeze_runaway(seq, crop_sz):
+            out = list(seq)
+            max_step = crop_sz * 0.20            # এক স্যাম্পল-ধাপের সীমা
+            frozen = None
+            for i in range(1, len(out)):
+                if frozen is not None:
+                    out[i] = frozen
+                    continue
+                if abs(out[i] - out[i - 1]) > max_step:
+                    frozen = out[i - 1]           # এখান থেকে জমে যাই
+                    out[i] = frozen
+            return out
+
+        txs = freeze_runaway(list(txs), crop_w)
+        tys = freeze_runaway(list(tys), crop_h)
 
         # ── Smoothing ─────────────────────────────────────────────────────
         # A critically-damped spring, not a dead-band. A dead-band holds still
