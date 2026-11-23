@@ -1237,6 +1237,27 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         dt = 1.0 / sample_fps
         snap_dist = crop_w * 0.35          # bigger than this = scene cut
 
+        # ── হার্ড কনটেইনমেন্ট (টার্গেট-নিরপেক্ষ) ──────────────────────────
+        # আগের সীমা ছিল "টার্গেটের ±২২%" — টার্গেট নিজেই কিনারায় গেলে ক্রপও
+        # কিনারায় বসে থাকত → বিষয় ফ্রেমের বাইরে। এখন সরাসরি নিয়ম:
+        # বিষয়ের কেন্দ্র অবশ্যই ক্রপ-ফ্রেমের ২০%–৮০% এর ভিতরে থাকবে (প্রতি স্যাম্পলে)।
+        # rel = বিষয়ের কেন্দ্র (0..1); ক্রপ x-কেন্দ্র rel-এর ±০.৩০ এর ভিতরে বাধ্য করি।
+        def contain_to_subject(pos_seq, tgt_seq, crop_sz, eff_sz, rels):
+            lo, hi = 0.30 * crop_sz, 0.70 * crop_sz
+            out = []
+            for pos, tgt, rel in zip(pos_seq, tgt_seq, rels):
+                s = rel * eff_sz                     # বিষয়ের কেন্দ্র (eff পিক্সেল)
+                x_min = s - hi                       # বিষয় ক্রপের ৭০% লাইনের ডানে নয়
+                x_max = s - lo                       # বিষয় ক্রপের ৩০% লাইনের বাঁয়ে নয়
+                x_min = max(0.0, x_min)
+                x_max = min(eff_sz - crop_sz, x_max)
+                if x_min > x_max:                    # বিষয় কিনারায় — কাছের সম্ভাব্য জায়গা
+                    c = min(max(s - crop_sz / 2, 0.0), eff_sz - crop_sz)
+                else:
+                    c = min(max(tgt, x_min), x_max)
+                out.append(c)
+            return out
+
         def stabilise(track, crop_sz):
             """
             শান্ত ক্যামেরা — "ডেড-জোন + সেন্টার-স্ন্যাপ" (ব্রডকাস্টে এভাবেই হয়)।
@@ -1289,6 +1310,12 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
 
         sm_x = stabilise(txs, crop_w) if track_x else list(txs)
         sm_y = stabilise(tys, crop_h) if track_y else list(tys)
+
+        # শেষ হার্ড-গ্যারান্টি: বিষয় **কখনোই** ফ্রেমের ৩০–৭০% এর বাইরে যাবে না
+        if track_x:
+            sm_x = contain_to_subject(sm_x, txs, crop_w, eff_w, rel_x)
+        if track_y:
+            sm_y = contain_to_subject(sm_y, tys, crop_h, eff_h, rel_y)
 
         def sample_at(track, input_t):
             """Linear interpolation of the 5 Hz track at any input timestamp."""
