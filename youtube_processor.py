@@ -747,7 +747,7 @@ class OneEuroFilter:
 #             physically cannot follow a subject up/down. Pre-zooming buys that
 #             room back without changing the final output size.
 TRACK_ZOOM_LONG = 1.02
-TRACK_ZOOM_SHORT = 1.02   # v1-এর মতো (বেশি জুম = বেশি নড়াচড়া/নরচরা)
+TRACK_ZOOM_SHORT = 1.15   # উল্লম্ব হেডরুম: ২৩px → ১৪৪px (মাথা ছাদে কাটা বন্ধ)
 
 
 # ─── Face beautification (skin + tone) ───────────────────────────────────
@@ -994,7 +994,12 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                         best_key, best = key, c
                 # সহনশীল দূরত্ব: আগে ০.৩০ ছিল — দুইজন মানুষ কাছাকাছি এলে
                 # ভুল মানুষ ধরে ফেলত। এখন ০.৫৫ (ভবিষ্যদ্বাণী সহ)।
-                if best_key is not None and best_key[0] <= 0.55:
+                # প্রক্সিমিটি-সীমা মুখের মাপের সমানুপাতিক: ক্লোজ-আপে (মুখ
+                # স্ক্রিন-ভরা) কেন্দ্র নড়ে অনেক দূরে — ছোট সীমায় লক ভেঙে
+                # বড় মুখে লাফাত ("দুই-মুখের দোলা")। সীমা = আগের মুখের
+                # প্রস্থের ১.৫× (ন্যূনতম ০.৫৫)।
+                _lim = max(0.55, 1.5 * math.sqrt(max(prev_size, 0.0)))
+                if best_key is not None and best_key[0] <= _lim:
                     return best, best[4]
 
             biggest = max(candidates, key=lambda c: c[2] * c[3])
@@ -1251,7 +1256,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 x_max = s - lo                       # বিষয় ক্রপের ৩০% লাইনের বাঁয়ে নয়
                 x_min = max(0.0, x_min)
                 x_max = min(eff_sz - crop_sz, x_max)
-                if x_min > x_max:                    # বিষয় কিনারায় — কাছের সম্ভাব্য জায়গা
+                if x_min > x_max:                    # বিষয় কিনারায় — একবারে সেন্টার
                     c = min(max(s - crop_sz / 2, 0.0), eff_sz - crop_sz)
                 else:
                     c = min(max(tgt, x_min), x_max)
@@ -1316,6 +1321,30 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             sm_x = contain_to_subject(sm_x, txs, crop_w, eff_w, rel_x)
         if track_y:
             sm_y = contain_to_subject(sm_y, tys, crop_h, eff_h, rel_y)
+
+        # ── চূড়ান্ত গতি-সীমা (কাট ছাড়া) ─────────────────────────────────
+        # কনটেইনমেন্টের ফলে মাঝে মাঝে ১২০–১৪০px/স্যাম্পল "পিছু নেওয়া" হয়
+        # (মানুষ ফ্রেমে ঢুকলে ক্রপ দৌড়ে পৌঁছায়) — চোখে লাফ লাগে। চূড়ান্ত
+        # ট্র্যাকে প্রতি স্যাম্পলে সর্বোচ্চ ১৫% ক্রপ-প্রস্থ নড়া দিই; একমাত্র
+        # শট-কাটের (টার্গেট >৪৫% লাফ) সাথে মিললে সীমা নেই — ওখানে একবারে
+        # নতুন মানুষে বসা স্বাভাবিক এবং কাটের সাথে মিলে যায়।
+        def final_speed_limit(seq, tgt_seq, crop_sz):
+            out = list(seq)
+            max_step = crop_sz * 0.15
+            jump = crop_sz * 0.45
+            for i in range(1, len(out)):
+                tstep = abs(tgt_seq[i] - tgt_seq[i - 1])
+                if tstep > jump:            # শট-কাট: সীমা নেই
+                    continue
+                delta = out[i] - out[i - 1]
+                if abs(delta) > max_step:
+                    out[i] = out[i - 1] + max_step if delta > 0 else out[i - 1] - max_step
+            return out
+
+        if track_x:
+            sm_x = final_speed_limit(sm_x, txs, crop_w)
+        if track_y:
+            sm_y = final_speed_limit(sm_y, tys, crop_h)
 
         def sample_at(track, input_t):
             """Linear interpolation of the 5 Hz track at any input timestamp."""
