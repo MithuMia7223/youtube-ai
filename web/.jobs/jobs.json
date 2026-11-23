@@ -460,5 +460,82 @@
   "rc": 0,
   "started": 1795277035.060791,
   "finished": 1795277131.344845
+ },
+ "bottest_1x1": {
+  "id": "bottest_1x1",
+  "title": "bottest_1x1.mp4",
+  "mode": "",
+  "dur": "",
+  "log": "/Users/mdmithumia/other_projects/youtube-ai/web/.jobs/bottest_1x1.log",
+  "pid": 0,
+  "rc": 0,
+  "started": 1795282192.9521651,
+  "finished": 1795282192.9521651
+ },
+ "free_222854": {
+  "id": "free_222854",
+  "title": "free_222854.mp4",
+  "mode": "",
+  "dur": "",
+  "log": "/Users/mdmithumia/other_projects/youtube-ai/web/.jobs/free_222854.log",
+  "pid": 0,
+  "rc": 0,
+  "started": 1795278571.555557,
+  "finished": 1795278571.555557
+ },
+ "free_223121": {
+  "id": "free_223121",
+  "title": "free_223121.mp4",
+  "mode": "",
+  "dur": "",
+  "log": "/Users/mdmithumia/other_projects/youtube-ai/web/.jobs/free_223121.log",
+  "pid": 0,
+  "rc": 0,
+  "started": 1795278731.4724286,
+  "finished": 1795278731.4724286
+ },
+ "free_223310": {
+  "id": "free_223310",
+  "title": "free_223310.mp4",
+  "mode": "",
+  "dur": "",
+  "log": "/Users/mdmithumia/other_projects/youtube-ai/web/.jobs/free_223310.log",
+  "pid": 0,
+  "rc": 0,
+  "started": 1795278839.5863326,
+  "finished": 1795278839.5863326
+ },
+ "longtest_169": {
+  "id": "longtest_169",
+  "title": "longtest_169.mp4",
+  "mode": "",
+  "dur": "",
+  "log": "/Users/mdmithumia/other_projects/youtube-ai/web/.jobs/longtest_169.log",
+  "pid": 0,
+  "rc": 0,
+  "started": 1795282486.4977398,
+  "finished": 1795282486.4977398
+ },
+ "longtest_raw": {
+  "id": "longtest_raw",
+  "title": "longtest_raw.mp4",
+  "mode": "",
+  "dur": "",
+  "log": "/Users/mdmithumia/other_projects/youtube-ai/web/.jobs/longtest_raw.log",
+  "pid": 0,
+  "rc": 0,
+  "started": 1795282469.0508368,
+  "finished": 1795282469.0508368
+ },
+ "223711": {
+  "id": "223711",
+  "title": "web_223711.mp4",
+  "mode": "",
+  "dur": "",
+  "log": "/Users/mdmithumia/other_projects/youtube-ai/web/.jobs/223711.log",
+  "pid": 0,
+  "rc": 0,
+  "started": 1795279177.0563962,
+  "finished": 1795279177.0563962
  }
 }
