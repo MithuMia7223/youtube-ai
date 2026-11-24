@@ -1193,11 +1193,28 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         g_x1 = [gb[2] if gb else rel_x[i] for i, gb in enumerate(gboxes)]
         g_y0 = [gb[1] if gb else rel_y[i] for i, gb in enumerate(gboxes)]
         g_y1 = [gb[3] if gb else rel_y[i] for i, gb in enumerate(gboxes)]
+        g_x0, g_x1, g_y0, g_y1 = (median5(g) for g in (g_x0, g_x1, g_y0, g_y1))
 
         # Desired crop offsets in the *cropped* frame's pixels, for every sample
         # মাথার উপরে জায়গা: টার্গেট-লাইন ৫০% → ৪২% (মুখ একটু উপরে,
         # শরীর নিচে — গ্রুপ শটে মাথা কাটা পড়ে না)
         face_y_frac = 0.42 if is_short else 0.50
+
+        def enforce_group(sm, e0, e1, crop_sz, eff_sz):
+            """সব মানুষ ক্রপের ভিতরে রাখা (হার্ড নিয়ম, সবশেষে)। ৩% ফাঁক রাখি।
+            সব মানুষ ক্রপের চেয়ে বড় হলে (খুব কাছের শট) মাঝখানে বসাই।"""
+            m = crop_sz * 0.03
+            out = []
+            for c, a, b in zip(sm, e0, e1):
+                A, B = a * eff_sz, b * eff_sz
+                lo = max(0.0, B + m - crop_sz)
+                hi = min(eff_sz - crop_sz, A - m)
+                if lo <= hi:
+                    c = min(max(c, lo), hi)
+                else:
+                    c = min(max((A + B) / 2 - crop_sz / 2, 0.0), eff_sz - crop_sz)
+                out.append(c)
+            return out
 
         def targets(rel_xv, rel_yv):
             tx = rel_xv * eff_w - crop_w / 2
@@ -1254,6 +1271,9 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
 
         txs = freeze_runaway(list(txs), crop_w)
         tys = freeze_runaway(list(tys), crop_h)
+        # সব মানুষ ক্রপের ভিতরে — টার্গেটেই (স্প্রিং মসৃণ করে), হার্ড ঝাঁকুনি নয়
+        txs = enforce_group(txs, g_x0, g_x1, crop_w, eff_w)
+        tys = enforce_group(tys, g_y0, g_y1, crop_h, eff_h)
 
         # ── Smoothing ─────────────────────────────────────────────────────
         # A critically-damped spring, not a dead-band. A dead-band holds still
@@ -1412,27 +1432,6 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             sm_x = final_speed_limit(sm_x, txs, crop_w)
         if track_y:
             sm_y = final_speed_limit(sm_y, tys, crop_h)
-
-        def enforce_group(sm, e0, e1, crop_sz, eff_sz):
-            """সব মানুষ ক্রপের ভিতরে রাখা (হার্ড নিয়ম, সবশেষে)। ৩% ফাঁক রাখি।
-            সব মানুষ ক্রপের চেয়ে বড় হলে (খুব কাছের শট) মাঝখানে বসাই।"""
-            m = crop_sz * 0.03
-            out = []
-            for c, a, b in zip(sm, e0, e1):
-                A, B = a * eff_sz, b * eff_sz
-                lo = max(0.0, B + m - crop_sz)
-                hi = min(eff_sz - crop_sz, A - m)
-                if lo <= hi:
-                    c = min(max(c, lo), hi)
-                else:
-                    c = min(max((A + B) / 2 - crop_sz / 2, 0.0), eff_sz - crop_sz)
-                out.append(c)
-            return out
-
-        if track_x:
-            sm_x = enforce_group(sm_x, g_x0, g_x1, crop_w, eff_w)
-        if track_y:
-            sm_y = enforce_group(sm_y, g_y0, g_y1, crop_h, eff_h)
 
         def sample_at(track, input_t):
             """Linear interpolation of the 5 Hz track at any input timestamp."""
