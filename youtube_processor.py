@@ -1395,11 +1395,14 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         sm_x = stabilise(txs, crop_w) if track_x else list(txs)
         sm_y = stabilise(tys, crop_h) if track_y else list(tys)
 
-        # শেষ হার্ড-গ্যারান্টি: বিষয় **কখনোই** ফ্রেমের ৩০–৭০% এর বাইরে যাবে না
+        # শেষ হার্ড-গ্যারান্টি: বিষয় **কখনোই** ফ্রেমের ৪০–৬০% এর বাইরে যাবে না।
+        # ⚠️ এখানে স্মুদ করা পজিশনকেই সীমায় বাঁধি (tgt = sm)। আগে কাঁচা টার্গেট
+        # (txs) পাঠানো হতো → ভিতরে থাকলেই স্প্রিংয়ের স্মুদিং বাতিল হয়ে কাঁচা,
+        # কাঁপা টার্গেট সরাসরি ক্রপে চলে যেত ("নরচরা")।
         if track_x:
-            sm_x = contain_to_subject(sm_x, txs, crop_w, eff_w, rel_x)
+            sm_x = contain_to_subject(sm_x, sm_x, crop_w, eff_w, rel_x)
         if track_y:
-            sm_y = contain_to_subject(sm_y, tys, crop_h, eff_h, rel_y)
+            sm_y = contain_to_subject(sm_y, sm_y, crop_h, eff_h, rel_y)
 
         # ── চূড়ান্ত গতি-সীমা (কাট ছাড়া) ─────────────────────────────────
         # কনটেইনমেন্টের ফলে মাঝে মাঝে ১২০–১৪০px/স্যাম্পল "পিছু নেওয়া" হয়
