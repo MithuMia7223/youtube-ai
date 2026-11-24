@@ -946,6 +946,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         ]
 
         centers = []  # (cx, cy) in 0..1; None while no subject seen yet
+        gboxes = []  # সব মানুষের মিলিত বাক্স (x0,y0,x1,y1) 0..1, বা None
         prev_c = None  # last accepted subject centre (for "sticky" selection)
         vel = [0.0, 0.0]   # বিষয়ের গতি (prediction-এর জন্য)
         prev_size = 0.0    # আগের মুখের ক্ষেত্রফল (মাপের ধারাবাহিকতা)
@@ -1122,9 +1123,12 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 prev_c = raw_c
                 prev_size = float(bw * bh)
                 centers.append((raw_c[0], min(cy, 1.0)))
+                gboxes.append((bx / sample_w, by / sample_h,
+                               (bx + bw) / sample_w, (by + bh) / sample_h))
             else:
                 # ⚠️ prev_c এখানে মুছি না — পরিচয় ধরে রাখি (উপরে ২.৫s টাইমআউট)
                 centers.append(None)
+                gboxes.append(None)
         proc.stdout.close()
         proc.wait()
 
@@ -1184,6 +1188,11 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
 
         rel_x = median5(rel_x)
         rel_y = median5(rel_y)
+        # সব মানুষের মিলিত বাক্সের সীমা (প্রতি স্যাম্পলে) — ক্রপের বাইরে কেউ না যায়
+        g_x0 = [gb[0] if gb else rel_x[i] for i, gb in enumerate(gboxes)]
+        g_x1 = [gb[2] if gb else rel_x[i] for i, gb in enumerate(gboxes)]
+        g_y0 = [gb[1] if gb else rel_y[i] for i, gb in enumerate(gboxes)]
+        g_y1 = [gb[3] if gb else rel_y[i] for i, gb in enumerate(gboxes)]
 
         # Desired crop offsets in the *cropped* frame's pixels, for every sample
         # মাথার উপরে জায়গা: টার্গেট-লাইন ৫০% → ৪২% (মুখ একটু উপরে,
@@ -1403,6 +1412,27 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             sm_x = final_speed_limit(sm_x, txs, crop_w)
         if track_y:
             sm_y = final_speed_limit(sm_y, tys, crop_h)
+
+        def enforce_group(sm, e0, e1, crop_sz, eff_sz):
+            """সব মানুষ ক্রপের ভিতরে রাখা (হার্ড নিয়ম, সবশেষে)। ৩% ফাঁক রাখি।
+            সব মানুষ ক্রপের চেয়ে বড় হলে (খুব কাছের শট) মাঝখানে বসাই।"""
+            m = crop_sz * 0.03
+            out = []
+            for c, a, b in zip(sm, e0, e1):
+                A, B = a * eff_sz, b * eff_sz
+                lo = max(0.0, B + m - crop_sz)
+                hi = min(eff_sz - crop_sz, A - m)
+                if lo <= hi:
+                    c = min(max(c, lo), hi)
+                else:
+                    c = min(max((A + B) / 2 - crop_sz / 2, 0.0), eff_sz - crop_sz)
+                out.append(c)
+            return out
+
+        if track_x:
+            sm_x = enforce_group(sm_x, g_x0, g_x1, crop_w, eff_w)
+        if track_y:
+            sm_y = enforce_group(sm_y, g_y0, g_y1, crop_h, eff_h)
 
         def sample_at(track, input_t):
             """Linear interpolation of the 5 Hz track at any input timestamp."""
