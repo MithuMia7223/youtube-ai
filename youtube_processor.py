@@ -1248,7 +1248,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # বিষয়ের কেন্দ্র অবশ্যই ক্রপ-ফ্রেমের ২০%–৮০% এর ভিতরে থাকবে (প্রতি স্যাম্পলে)।
         # rel = বিষয়ের কেন্দ্র (0..1); ক্রপ x-কেন্দ্র rel-এর ±০.৩০ এর ভিতরে বাধ্য করি।
         def contain_to_subject(pos_seq, tgt_seq, crop_sz, eff_sz, rels):
-            lo, hi = 0.30 * crop_sz, 0.70 * crop_sz
+            lo, hi = 0.40 * crop_sz, 0.60 * crop_sz   # বিষয় ফ্রেমের ৪০–৬০% (মাঝে)
             out = []
             for pos, tgt, rel in zip(pos_seq, tgt_seq, rels):
                 s = rel * eff_sz                     # বিষয়ের কেন্দ্র (eff পিক্সেল)
@@ -1312,6 +1312,17 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             # বিষয় সবসময় ফ্রেমের ৩৫–৬৫% এর ভিতরে → কাটার সুযোগ নেই
             lim = crop_sz * 0.15
             return [max(tgt - lim, min(tgt + lim, s)) for s, tgt in zip(out, track)]
+
+        # ── কেন্দ্র-ভিত্তিক টার্গেট ─────────────────────────────────────────
+        # লক্ষ্য: বিষয় **ফ্রেমের কেন্দ্রে**। আগে ডেড-জোন টার্গেটের সাপেক্ষে ছিল —
+        # বিষয় ফ্রেমের ডানে স্থির হলেও ক্রপ "যথেষ্ট কাছে" ভেবে নড়ত না →
+        # মানুষ ফ্রেমের ৭০% পর্যন্ত সরে যেত। এখন প্রথমে টার্গেটকে
+        # contain_to_subject দিয়ে বিষয়-কেন্দ্রিক করি, তারপর স্মুদিং — ডেড-জোন
+        # এখন "কেন্দ্র-ব্যান্ডে" কাজ করে, বিষয় কেন্দ্রের কাছে হলেই ক্যামেরা স্থির।
+        if track_x:
+            txs = contain_to_subject(list(txs), list(txs), crop_w, eff_w, rel_x)
+        if track_y:
+            tys = contain_to_subject(list(tys), list(tys), crop_h, eff_h, rel_y)
 
         sm_x = stabilise(txs, crop_w) if track_x else list(txs)
         sm_y = stabilise(tys, crop_h) if track_y else list(tys)
