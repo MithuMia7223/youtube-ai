@@ -956,7 +956,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         cut_count = [0]          # কতগুলো শট-কাট ধরা পড়েছে
         motion_hist = [[]]       # মোশন-ফলব্যাকের সাম্প্রতিক কেন্দ্র (স্থিরতা যাচাই)
         no_face_run = [0]        # টানা কত ফ্রেম কোনো মুখ/শরীর পাওয়া যায়নি
+        diff_avg = [2.0]         # চলমান ফ্রেম-diff গড় (গতিশীল কাট-সীমার জন্য)
+        _last_for_diff = [None]  # চলমান গড়ের জন্য আগের ফ্রেম
         motion_streak = [0]      # টানা কত ফ্রেম একই জায়গায় নড়াচড়া
+        cut_at = []              # কোন স্যাম্পল-ইনডেক্সে শট-কাট ধরা পড়েছে
 
         def pick(candidates, prev):
             """
@@ -998,7 +1001,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 # স্ক্রিন-ভরা) কেন্দ্র নড়ে অনেক দূরে — ছোট সীমায় লক ভেঙে
                 # বড় মুখে লাফাত ("দুই-মুখের দোলা")। সীমা = আগের মুখের
                 # প্রস্থের ১.৫× (ন্যূনতম ০.৫৫)।
-                _lim = max(0.55, 1.5 * math.sqrt(max(prev_size, 0.0)))
+                _lim = max(0.35, 1.5 * math.sqrt(max(prev_size, 0.0)))
                 if best_key is not None and best_key[0] <= _lim:
                     return best, best[4]
 
@@ -1094,13 +1097,23 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             if prev_gray_ref[0] is not None:
                 try:
                     _dd = cv2.absdiff(gray, prev_gray_ref[0])
-                    if float(np.percentile(_dd, 50)) > 16.0:      # ধারালো দৃশ্য বদল
+                    # কাট-মাপ: গড় diff নয় (হালকা কাট diff=২-এ হারায়), গতিশীল
+                    # সীমা = চলমান গড়ের ৪× (ন্যূনতম ৪) — হালকা কাট ধরে, সাধারণ
+                    # ক্যামেরা-নড়া ফলস হয় না।
+                    _mv = float(np.mean(_dd))
+                    if float(np.percentile(_dd, 50)) > max(4.0, 4.0 * diff_avg[0]):
                         prev_c, prev_size, vel = None, 0.0, [0.0, 0.0]
                         misses = 0
                         cut_count[0] += 1
+                        cut_at.append(len(centers))   # এই স্যাম্পলেই কাট
                 except Exception:
                     pass
             prev_gray_ref[0] = gray
+            try:
+                diff_avg[0] = 0.95 * diff_avg[0] + 0.05 * float(np.mean(cv2.absdiff(gray, _last_for_diff[0] if _last_for_diff[0] is not None else gray)))
+                _last_for_diff[0] = gray
+            except Exception:
+                pass
 
             if box is not None:
                 misses = 0
@@ -1218,15 +1231,39 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # কোনো অংশে টার্গেট এক সেকেন্ডে ২০% ক্রপ-প্রস্থের বেশি দৌড়ালে সেই
         # অংশ জমে যায় (শেষ স্থান ধরে রাখি) — স্থির ফ্রেম অগোছালো প্যানের চেয়ে ভালো।
         def freeze_runaway(seq, crop_sz):
+            """
+            প্যান-শট গার্ড (ভ২-সংশোধিত)।
+
+            আগের সংস্করণ একবার জমলে **শেষ পর্যন্ত** জমে থাকত — শট-কাটে
+            নতুন মানুষের টার্গেট লাফ (৪৩২→৬১৭px) ধরা পড়ে সারা শট ধরে
+            টার্গেট পুরোনো জায়গায় আটকে থাকত; contain তখন টার্গেটকে
+            ব্যান্ডের কিনারায় ঠেলে দিত → ক্রিয়েটর স্থায়ীভাবে ৬০%-এ বসে
+            থাকত ("ক্রিয়েটর মাঝে থাকবে" ভাঙত)।
+
+            এখন: টার্গেট টানা টানা বড় লাফ দিলে (আসল ক্যামেরা-প্যান) জমি,
+            কিন্তু টার্গেট ৬ স্যাম্পল (০.৫s) স্থির থাকলে **ছেড়ে দিই** —
+            নতুন মানুষের কাছে স্প্রিং মসৃণভাবে এগিয়ে যায়।
+            """
             out = list(seq)
             max_step = crop_sz * 0.20            # এক স্যাম্পল-ধাপের সীমা
             frozen = None
+            calm = 0
             for i in range(1, len(out)):
+                # ক্যালম-মাপ **কাঁচা** মানে (out ওভাররাইট হয়ে যায়)
+                step_raw = abs(seq[i] - seq[i - 1])
                 if frozen is not None:
-                    out[i] = frozen
-                    continue
-                if abs(out[i] - out[i - 1]) > max_step:
-                    frozen = out[i - 1]           # এখান থেকে জমে যাই
+                    if step_raw < max_step * 0.25:
+                        calm += 1
+                        if calm >= 6:            # ০.৫s স্থির → ছেড়ে দিই
+                            frozen = None
+                            calm = 0
+                    else:
+                        calm = 0
+                    if frozen is not None:
+                        out[i] = frozen
+                elif step_raw > max_step:
+                    frozen = seq[i - 1]           # এখান থেকে জমে যাই
+                    calm = 0
                     out[i] = frozen
             return out
 
@@ -1263,6 +1300,8 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 out.append(c)
             return out
 
+        cut_mask = set(cut_at)
+
         def stabilise(track, crop_sz):
             """
             শান্ত ক্যামেরা — "ডেড-জোন + সেন্টার-স্ন্যাপ" (ব্রডকাস্টে এভাবেই হয়)।
@@ -1285,14 +1324,29 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             #   • বড় ডেড-জোন (২২%) — এর ভিতরে থাকলে ক্যামেরা **এক পিক্সেলও নড়ে না**
             #   • খুব ধীর প্যান (৮% ক্রপ/সেকেন্ড) — চোখে প্রায় অদৃশ্য
             #   • বড় tau (০.৯s) — নরম ইজিং, হঠাৎ শুরু/থামা নেই
-            idle_zone = crop_sz * 0.22
-            settle = crop_sz * 0.06
+            # ডেড-জোন ২২% ছিল — তাতে বিষয় স্থায়ীভাবে কেন্দ্র থেকে ২২% পর্যন্ত
+            # সরে বসে থাকত ("ক্রিয়েটর মাঝে থাকবে" ভাঙত)। এখন ১০%: বিষয় কেন্দ্র
+            # থেকে ১০%-এর বেশি সরলে ক্যামেরা মসৃণভাবে এগিয়ে তাকে আবার মাঝে
+            # আনে; ১০%-এর ভিতরে থাকলে ক্যামেরা সম্পূর্ণ স্থির (নরচরা নেই)।
+            # ডেড-জোন এখন ৫%: বিষয় কেন্দ্র থেকে ৫%-এর (৪৩px) বেশি সরলে
+            # ক্যামেরা মসৃণভাবে এগিয়ে তাকে মাঝে আনে — ৪০–৬০% ব্যান্ড
+            # কঠোরভাবে ধরে রাখে। নড়াটা ধীর (৮%/সে + tau ০.৯s) তাই চোখে
+            # শান্ত লাগে, ঝাঁকুনি নেই।
+            idle_zone = crop_sz * 0.05
+            settle = crop_sz * 0.03
             slow = crop_sz * 0.08
             fast = crop_sz * 0.45
             tau = 0.9
             pos, moving, out = track[0], False, []
-            for tgt in track:
+            for i, tgt in enumerate(track):
                 err = tgt - pos
+                if cut_mask and i in cut_mask:
+                    # শট-কাট: একবারে নতুন বিষয়ের জায়গায় বসাই (কাটের সাথে
+                    # মিলে যায়, চোখে লাগে না) — নইলে স্প্রিং প্রায় পুরো শট
+                    # ধরে পিছু নিত আর ক্রিয়েটর কিনারায় থাকত।
+                    pos, moving = tgt, False
+                    out.append(pos)
+                    continue
                 if abs(err) > crop_sz * 0.25:
                     # দৃশ্য বদল → সাথে সাথে বসাই। (০.৬ ক্রপ/সেকেন্ডের "গ্লাইড"
                     # চেষ্টা করেছিলাম — তাতে কয়েক ফ্রেম বিষয় কিনারায় গিয়ে
@@ -1306,7 +1360,21 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                     moving = False
                 if moving:
                     step = err * min(1.0, dt / tau)
-                    cap = (fast if abs(err) > crop_sz * 0.25 else slow) * dt
+                    # টার্গেট যদি স্বয়ং দ্রুত এগোয় (হাঁটা/প্যান ফলো), ক্রপকেও
+                    # তার ছন্দে যেতে দিতে হয় — নইলে মানুষ ক্রপের কিনারায়
+                    # চলে যায় ("ট্র্যাকিং ক্রিয়েটর মাঝে থাকবে" ভাঙে)। টার্গেট
+                    # -গতি = সাম্প্রতিক টার্গেট-পরিবর্তন।
+                    # ক্যাপ-স্তর: বিষয় কেন্দ্র থেকে অনেক দূরে (>১৫%) হলে
+                    # ধরতে হয় দ্রুত (২৫%/সে) — নইলে স্প্রিং পুরো শট ধরে
+                    # পিছু নিত আর ক্রিয়েটর কিনারায় বসে থাকত। ছোট দূরত্বে
+                    # ধীর (৮%/সে) — শান্ত ক্যামেরা।
+                    _e = abs(err)
+                    if _e > crop_sz * 0.25:
+                        cap = fast
+                    elif _e > crop_sz * 0.15:
+                        cap = crop_sz * 0.25
+                    else:
+                        cap = slow
                     pos += max(-cap, min(cap, step))
                 out.append(pos)
             # বিষয় সবসময় ফ্রেমের ৩৫–৬৫% এর ভিতরে → কাটার সুযোগ নেই
