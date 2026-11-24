@@ -960,53 +960,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         _last_for_diff = [None]  # চলমান গড়ের জন্য আগের ফ্রেম
         motion_streak = [0]      # টানা কত ফ্রেম একই জায়গায় নড়াচড়া
         cut_at = []              # কোন স্যাম্পল-ইনডেক্সে শট-কাট ধরা পড়েছে
-
-        def pick(candidates, prev):
-            """
-            Choose which detection is *our* subject.
-
-            Picking the biggest face is what makes tracking look unstable: the
-            moment a second person walks in, the crop abandons the subject it
-            was following and slides across the frame. So we prefer the face
-            closest to where the subject was last seen, and only fall back to
-            the biggest one when that face has genuinely disappeared.
-            """
-            if not candidates:
-                return None, False
-
-            def ctr(c):
-                return ((c[0] + c[2] / 2) / sample_w, (c[1] + c[3] / 2) / sample_h)
-
-            if prev is not None:
-                # গতিবেগ দিয়ে ভবিষ্যদ্বাণী: দ্রুত হাঁটা/ক্যামেরা প্যানে বিষয়
-                # ৩০%-এর বেশি সরে গেলেও আগের মানুষটাকেই ধরা পড়ে।
-                px = prev[0] + vel[0]
-                py = prev[1] + vel[1]
-                best_key, best = None, None
-                for c in candidates:
-                    cx, cy = ctr(c)
-                    d = math.hypot(cx - px, cy - py)
-                    d_prev = math.hypot(cx - prev[0], cy - prev[1])
-                    # মাপের ধারাবাহিকতা: কাছের মানুষ → দূরের মানুষ লাফ দেওয়া বন্ধ
-                    size_pen = 0.0
-                    if prev_size:
-                        area = c[2] * c[3]
-                        size_pen = min(1.5, abs(math.log(max(area, 1e-6) / prev_size)))
-                    key = (round(d + 0.35 * size_pen, 4), d_prev)
-                    if best_key is None or key < best_key:
-                        best_key, best = key, c
-                # সহনশীল দূরত্ব: আগে ০.৩০ ছিল — দুইজন মানুষ কাছাকাছি এলে
-                # ভুল মানুষ ধরে ফেলত। এখন ০.৫৫ (ভবিষ্যদ্বাণী সহ)।
-                # প্রক্সিমিটি-সীমা মুখের মাপের সমানুপাতিক: ক্লোজ-আপে (মুখ
-                # স্ক্রিন-ভরা) কেন্দ্র নড়ে অনেক দূরে — ছোট সীমায় লক ভেঙে
-                # বড় মুখে লাফাত ("দুই-মুখের দোলা")। সীমা = আগের মুখের
-                # প্রস্থের ১.৫× (ন্যূনতম ০.৫৫)।
-                _lim = max(0.35, 1.5 * math.sqrt(max(prev_size, 0.0)))
-                if best_key is not None and best_key[0] <= _lim:
-                    return best, best[4]
-
-            biggest = max(candidates, key=lambda c: c[2] * c[3])
-            return biggest, biggest[4]
+        recent_people = []       # (স্যাম্পল, x0, y0, x1, y1, মুখ?) — সাম্প্রতিক সব মানুষ
 
         while True:
             buf = proc.stdout.read(frame_bytes)
@@ -1029,7 +983,29 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                             candidates.append((float(bx), float(by), float(bw), float(bh), bool(face_cascade)))
                         break
 
-            box, is_face = pick(candidates, prev_c)
+            # ── সব কনটেন্ট-ক্রিয়েটর একসাথে ─────────────────────────────────
+            # আগে একজনকে "বিষয়" ধরে বাকিদের বাদ দিত → ক্রপ এক মানুষ থেকে
+            # অন্যজনে লাফাত। এখন সব ডিটেকশনের মিলিত বাক্স (ইউনিয়ন) ধরি, তাই
+            # ক্রপের কেন্দ্র সবার মাঝখানে থাকে এবং কেউ কাটা পড়ে না। ছোট
+            # ভুয়া ডিটেকশন (সবচেয়ে বড় মুখের অর্ধেকেরও কম) বাদ দিই।
+            # একজন এক ফ্রেম মিস হলেই গ্রুপ বদলাতে না পারে: প্রতিটি মানুষের
+            # শেষ-দেখা ডিটেকশন ২ সেকেন্ড পর্যন্ত গ্রুপে থাকে (ফ্লিকার বন্ধ)।
+            if candidates:
+                _mw = max(c[2] for c in candidates)
+                for c in candidates:
+                    if c[2] >= 0.5 * _mw:
+                        recent_people.append((len(centers), c[0], c[1], c[0] + c[2], c[1] + c[3], c[4]))
+            _keep_n = len(centers)
+            recent_people[:] = [r for r in recent_people if _keep_n - r[0] <= int(sample_fps * 2.0)]
+            if recent_people:
+                _x0 = min(r[1] for r in recent_people)
+                _y0 = min(r[2] for r in recent_people)
+                _x1 = max(r[3] for r in recent_people)
+                _y1 = max(r[4] for r in recent_people)
+                box = (_x0, _y0, _x1 - _x0, _y1 - _y0, recent_people[-1][5])
+                is_face = recent_people[-1][5]
+            else:
+                box, is_face = None, False
 
             # ── মোশন ফলব্যাক ────────────────────────────────────────────────
             # পিঠ ঘুরানো শট, দূরের ওয়াইড শট, অন্ধকার দৃশ্য — মুখ/শরীর কোনোটাই
