@@ -817,10 +817,15 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
     if is_short:
         z = TRACK_ZOOM_SHORT
         out = f"scale={out_w or 1080}:{out_h or 1080}:flags=lanczos"
+        # ⚠️ x=0:y=0 (plain integers, NOT expressions) — if we use x='(iw-ow)/2' FFmpeg
+        # re-evaluates the expression every frame and overwrites sendcmd's value with the
+        # centred default.  Plain 0 is set once at init; every sendcmd after that sticks.
+        # sendcmd will position from frame-0, so the first few frames use x=0 until the
+        # first sendcmd at t=0.000 fires (which is the very first frame).
         return (
             f"scale=iw*{z}:ih*{z},{face_cmd_prefix}"
             f"crop@sq=w='trunc(min(iw,ih)/{z}/2)*2':h='trunc(min(iw,ih)/{z}/2)*2':"
-            f"x='(iw-ow)/2':y='(ih-oh)/2',{out}"
+            f"x=0:y=0,{out}"
         )
     # লং: ক্রপ-উইন্ডো **১৬:৯** — উৎস ৪:৩ বা ৯:১৬ হলেও আউটপুট বিকৃত হবে না,
     # আর উইন্ডো ফ্রেমের ভিতরে থাকে বলে কোনো কালো বার আসে না।
@@ -828,11 +833,12 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
     # ⚠️ এই চেইনে **একটাই** crop থাকতে হবে — sendcmd `crop x/y` ফিল্টার-ইনডেক্স
     # ধরে কাজ করে; বাড়তি crop বসালে কমান্ড ভুল ফিল্টারে গিয়ে ট্র্যাকিং স্থির
     # হয়ে যায় (ঠিক এই ভুলটাই হয়েছিল)। ক্রপ-উইন্ডো ১৬:৯, তাই scale-ই যথেষ্ট।
+    # Same fix as above: x=0:y=0 (plain integers) so sendcmd overrides stick.
     return (
         f"{face_cmd_prefix}"
         f"crop@sq=w='trunc(min(iw,ih*16/9)/{TRACK_ZOOM_LONG}/2)*2':"
         f"h='trunc(min(ih,iw*9/16)/{TRACK_ZOOM_LONG}/2)*2':"
-        f"x='(iw-ow)/2':y='(ih-oh)/2',{out},setsar=1"
+        f"x=0:y=0,{out},setsar=1"
     )
 
 
@@ -1262,9 +1268,9 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             """৯-ট্যাপ বিনমিয়াল লোপাস (প্রতিসম → অতিরিক্ত দেরি নেই)।"""
             if passes is None:
                 try:
-                    passes = int(os.environ.get("TRACK_SOFT", "4"))
+                    passes = int(os.environ.get("TRACK_SOFT", "0"))
                 except Exception:
-                    passes = 2
+                    passes = 0
             k = (1, 8, 28, 56, 70, 56, 28, 8, 1)
             s = list(seq)
             for _ in range(passes):
@@ -1497,11 +1503,38 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # মানুষ ফ্রেমের ৭০% পর্যন্ত সরে যেত। এখন প্রথমে টার্গেটকে
         # contain_to_subject দিয়ে বিষয়-কেন্দ্রিক করি, তারপর স্মুদিং — ডেড-জোন
         # এখন "কেন্দ্র-ব্যান্ডে" কাজ করে, বিষয় কেন্দ্রের কাছে হলেই ক্যামেরা স্থির।
-        _contain_on = os.environ.get("TRACK_CONTAIN", "1").strip() not in ("0", "false", "off")
+        _contain_on = os.environ.get("TRACK_CONTAIN", "0").strip() not in ("0", "false", "off")
         if track_x and _contain_on:
             txs = contain_to_subject(list(txs), list(txs), crop_w, eff_w, rel_x)
         if track_y and _contain_on:
             tys = contain_to_subject(list(tys), list(tys), crop_h, eff_h, rel_y)
+
+        def follow_center(track, crop_sz, cuts):
+            """
+            সেন্টার-ট্র্যাকিং: বিষয়কে সবসময় ফ্রেমের ঠিক মধ্যবিন্দুতে (Exact Middle Point) রাখা।
+            - শট-কাট বা দৃশ্য পরিবর্তন হলে সাথে সাথে সেন্টারে লক করে।
+            - স্বাভাবিক চলাফেরার সময় মসৃণভাবে মধ্যবিন্দু অনুসরণ করে (কোনো কৃত্রিম ডেড-জোন নেই
+              যা মানুষকে একপাশে আটকে রাখবে)।
+            - ৩ পিক্সেলের নিচের মাইক্রো-ফ্লিকার ফিল্টার করে যাতে ক্যামেরা সম্পূর্ণ স্থির থাকে।
+            """
+            try:
+                tau = float(os.environ.get("TRACK_TAU", "0.22"))
+            except Exception:
+                tau = 0.22
+            vmax = crop_sz * 0.25
+            alpha = min(1.0, dt / tau)
+            pos = track[0]
+            out = []
+            for i, tgt in enumerate(track):
+                if (cuts and i in cuts) or abs(tgt - pos) > crop_sz * 0.35:
+                    pos = tgt
+                else:
+                    err = tgt - pos
+                    if abs(err) > 3.0:
+                        step = err * alpha
+                        pos += max(-vmax, min(vmax, step))
+                out.append(pos)
+            return out
 
         def follow(track, crop_sz, cuts):
             """
@@ -1628,19 +1661,23 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 out.append(pos)
             return out
 
-        mode = os.environ.get("TRACK_FOLLOW", "ab").strip().lower()
-        if mode == "spring":
+        cut_set = set(cut_at)
+        mode = os.environ.get("TRACK_FOLLOW", "center").strip().lower()
+        if mode == "center":
+            sm_x = follow_center(txs, crop_w, cut_set) if track_x else list(txs)
+            sm_y = follow_center(tys, crop_h, cut_set) if track_y else list(tys)
+        elif mode == "spring":
             sm_x = stabilise(txs, crop_w) if track_x else list(txs)
             sm_y = stabilise(tys, crop_h) if track_y else list(tys)
         elif mode == "hold":
-            sm_x = follow_hold(txs, crop_w, set(cut_at)) if track_x else list(txs)
-            sm_y = follow_hold(tys, crop_h, set(cut_at)) if track_y else list(tys)
+            sm_x = follow_hold(txs, crop_w, cut_set) if track_x else list(txs)
+            sm_y = follow_hold(tys, crop_h, cut_set) if track_y else list(tys)
         elif mode == "lag":
-            sm_x = follow(txs, crop_w, set(cut_at)) if track_x else list(txs)
-            sm_y = follow(tys, crop_h, set(cut_at)) if track_y else list(tys)
+            sm_x = follow(txs, crop_w, cut_set) if track_x else list(txs)
+            sm_y = follow(tys, crop_h, cut_set) if track_y else list(tys)
         else:
-            sm_x = follow_ab(txs, crop_w, set(cut_at)) if track_x else list(txs)
-            sm_y = follow_ab(tys, crop_h, set(cut_at)) if track_y else list(tys)
+            sm_x = follow_ab(txs, crop_w, cut_set) if track_x else list(txs)
+            sm_y = follow_ab(tys, crop_h, cut_set) if track_y else list(tys)
 
         # শেষ হার্ড-গ্যারান্টি: বিষয় **কখনোই** ফ্রেমের ৪০–৬০% এর বাইরে যাবে না।
         # ⚠️ এখানে স্মুদ করা পজিশনকেই সীমায় বাঁধি (tgt = sm)। আগে কাঁচা টার্গেট
@@ -1655,25 +1692,27 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # কনটেইনমেন্টের ফলে মাঝে মাঝে ১২০–১৪০px/স্যাম্পল "পিছু নেওয়া" হয়
         # (মানুষ ফ্রেমে ঢুকলে ক্রপ দৌড়ে পৌঁছায়) — চোখে লাফ লাগে। চূড়ান্ত
         # ট্র্যাকে প্রতি স্যাম্পলে সর্বোচ্চ ১৫% ক্রপ-প্রস্থ নড়া দিই; একমাত্র
-        # শট-কাটের (টার্গেট >৪৫% লাফ) সাথে মিললে সীমা নেই — ওখানে একবারে
+        # শট-কাটের (টার্গেট >৩৫% লাফ) সাথে মিললে সীমা নেই — ওখানে একবারে
         # নতুন মানুষে বসা স্বাভাবিক এবং কাটের সাথে মিলে যায়।
-        def final_speed_limit(seq, tgt_seq, crop_sz):
+        def final_speed_limit(seq, tgt_seq, crop_sz, cuts=None):
             out = list(seq)
             max_step = crop_sz * 0.15
-            jump = crop_sz * 0.45
+            jump = crop_sz * 0.35
             for i in range(1, len(out)):
+                if cuts and i in cuts:
+                    continue
                 tstep = abs(tgt_seq[i] - tgt_seq[i - 1])
                 if tstep > jump:            # শট-কাট: সীমা নেই
                     continue
                 delta = out[i] - out[i - 1]
                 if abs(delta) > max_step:
-                    out[i] = out[i - 1] + max_step if delta > 0 else out[i - 1] - max_step
+                    out[i] = out[i - 1] + (max_step if delta > 0 else -max_step)
             return out
 
         if track_x:
-            sm_x = final_speed_limit(sm_x, txs, crop_w)
+            sm_x = final_speed_limit(sm_x, txs, crop_w, cut_set)
         if track_y:
-            sm_y = final_speed_limit(sm_y, tys, crop_h)
+            sm_y = final_speed_limit(sm_y, tys, crop_h, cut_set)
 
         def sample_at(track, input_t):
             """Linear interpolation of the 5 Hz track at any input timestamp."""
@@ -1683,6 +1722,8 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 return track[-1]
             if i < 0:
                 return track[0]
+            if (i + 1) in cut_set:
+                return track[i]
             f = pos - i
             return track[i] + (track[i + 1] - track[i]) * f
 
@@ -1700,10 +1741,11 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             t_in = min(t_out * speed_factor, max(duration - 1e-3, 0.0))
             if track_x:
                 x_px = int(round(min(max(sample_at(sm_x, t_in), 0), eff_w - crop_w)))
-                lines.append(f"{t_out:.3f} crop@sq x {x_px};")
+                _tgt = os.environ.get("TRACK_TGT", "crop@sq")
+                lines.append(f"{t_out:.3f} {_tgt} x {x_px};")
             if track_y:
                 y_px = int(round(min(max(sample_at(sm_y, t_in), 0), eff_h - crop_h)))
-                lines.append(f"{t_out:.3f} crop@sq y {y_px};")
+                lines.append(f"{t_out:.3f} {os.environ.get('TRACK_TGT', 'crop@sq')} y {y_px};")
         if not lines:
             return None
 
