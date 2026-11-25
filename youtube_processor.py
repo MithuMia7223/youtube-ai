@@ -837,7 +837,7 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
 
 
 def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0, out_fps=None,
-                            content_w=None, content_h=None, pre_crop=""):
+                            content_w=None, content_h=None, pre_crop="", sample_w=None):
     """
     Subject-tracking (face + body) crop helper.
 
@@ -911,7 +911,14 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             return None  # window already covers the frame; nothing to follow
 
         # Detect on small hflipped frames (hflip matches the processing chain)
-        sample_w = 320
+        # ৩২০ → ৪৮০: ৩২০-এ দুই-তিনজনের গ্রুপ শটে ছোট মুখগুলো YuNet মিস করত,
+        # তাই ক্রপ একজনের দিকে সরে গিয়ে অন্যজন কিনারায় কাটা পড়ত। ৪৮০-এ
+        # ডিটেকশন অনেক নির্ভরযোগ্য, খরচ সামান্য বেশি। TRACK_SAMPLE_W দিয়ে বদলানো যায়।
+        try:
+            sample_w = int(sample_w or os.environ.get("TRACK_SAMPLE_W", "480"))
+        except Exception:
+            sample_w = 480
+        sample_w = max(160, min(sample_w, 960))
         sample_h = max(2, int(round(src_h * sample_w / src_w / 2.0)) * 2)
         sample_cmd = [
             "ffmpeg", "-v", "error",
@@ -931,7 +938,11 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                                   "assets", "models", "face_detection_yunet_2023mar.onnx")
         if os.path.exists(model_path):
             try:
-                yunet = cv2.FaceDetectorYN_create(model_path, "", (sample_w, sample_h), score_threshold=0.55)
+                # ০.৫৫ → ০.৫০: পাশাপাশি দাঁড়ানো/হালকা ঘোরানো মুখ ০.৫৫-এ বাদ
+                # পড়ত (গ্রুপ শটে একজনের বাক্স হারিয়ে যেত)। TRACK_FACE_SCORE দিয়ে নিয়ন্ত্রণ।
+                yunet = cv2.FaceDetectorYN_create(
+                    model_path, "", (sample_w, sample_h),
+                    score_threshold=float(os.environ.get("TRACK_FACE_SCORE", "0.50")))
             except Exception as e:
                 print(f"[subject-track] YuNet load failed ({e}); using Haar cascades only")
                 yunet = None
@@ -961,6 +972,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         _last_for_diff = [None]  # চলমান গড়ের জন্য আগের ফ্রেম
         motion_streak = [0]      # টানা কত ফ্রেম একই জায়গায় নড়াচড়া
         cut_at = []              # কোন স্যাম্পল-ইনডেক্সে শট-কাট ধরা পড়েছে
+        prev_hist = [None]       # আগের ফ্রেমের রঙ-হিস্টোগ্রাম (শট-কাট সনাক্তের জন্য)
         recent_people = []       # (স্যাম্পল, x0, y0, x1, y1, মুখ?) — সাম্প্রতিক সব মানুষ
 
         while True:
@@ -1071,6 +1083,30 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
             # ── নাটকের "কাট" (shot change) সনাক্ত → নতুন শটে নতুন করে লক ────
             # প্রতিটি শটে মানুষ আলাদা জায়গায়। কাট না ধরলে আগের শটের অবস্থানে
             # ক্রপ আটকে থাকে → নতুন শটের মানুষ কাটা পড়ে ("প্রতিটা কাটে ঠিক করো")।
+            # ── হিস্টোগ্রাম-ভিত্তিক শট-কাট ─────────────────────────────────────
+            # শুধু পিক্সেল-diff-এর মিডিয়ান দিয়ে কাট ধরলে সমান উজ্জ্বলতার দুই শট
+            # (ড্রামায় খুব সাধারণ) ধরা পড়ে না → কাটে ক্রপ পুরোনো জায়গায় আটকে
+            # থাকত, নতুন মানুষ কিনারায়/কাটা পড়ত। তাই রঙ-হিস্টোগ্রামের দূরত্বও
+            # মাপি (০ = একই, ১ = সম্পূর্ণ আলাদা):
+            #   • > ০.৫৫ → নিশ্চিত কাট
+            #   • > ০.৩০ এবং মুখ আগের জায়গা থেকে > ১২% লাফ দিয়েছে → কাট
+            _hist_cut = False
+            try:
+                _sm = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
+                _h = cv2.calcHist([_sm], [0, 1, 2], None, [8, 8, 8], [0, 256] * 3)
+                cv2.normalize(_h, _h, 1, 0, cv2.NORM_L1)
+                if prev_hist[0] is not None:
+                    _hd = cv2.compareHist(prev_hist[0], _h, cv2.HISTCMP_BHATTACHARYYA)
+                    if _hd > 0.55:
+                        _hist_cut = True
+                    elif _hd > 0.30 and box is not None and prev_c is not None:
+                        _bcx = (box[0] + box[2] / 2) / sample_w
+                        _bcy = (box[1] + box[3] / 2) / sample_h
+                        if math.hypot(_bcx - prev_c[0], _bcy - prev_c[1]) > 0.12:
+                            _hist_cut = True
+                prev_hist[0] = _h
+            except Exception:
+                pass
             if prev_gray_ref[0] is not None:
                 try:
                     _dd = cv2.absdiff(gray, prev_gray_ref[0])
@@ -1078,7 +1114,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                     # সীমা = চলমান গড়ের ৪× (ন্যূনতম ৪) — হালকা কাট ধরে, সাধারণ
                     # ক্যামেরা-নড়া ফলস হয় না।
                     _mv = float(np.mean(_dd))
-                    if float(np.percentile(_dd, 50)) > max(4.0, 4.0 * diff_avg[0]):
+                    if _hist_cut or float(np.percentile(_dd, 50)) > max(4.0, 4.0 * diff_avg[0]):
                         prev_c, prev_size, vel = None, 0.0, [0.0, 0.0]
                         misses = 0
                         cut_count[0] += 1
@@ -1188,12 +1224,36 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
 
         rel_x = median5(rel_x)
         rel_y = median5(rel_y)
+        # ── ফ্লিকার-স্মুথিং (মিডিয়ানের পরে) ──────────────────────────────
+        # ৪৮০-পিক্সেলে ডিটেকশন অনেক বেশি কাজ করে (৪৯০/৪৯২ স্যাম্পল), কিন্তু
+        # প্রতিটি মুখের বাক্স প্রতি ফ্রেমে ±২–৪px নড়ে → ইউনিয়ন-বাক্সের কেন্দ্র
+        # ±১.৫% করে দোলে, আর ক্রপে সেটা ~১০px "নরচরা" হয়ে দেখা যায়। মিডিয়ান
+        # শুধু এক-ফ্রেম স্পাইক মোছে, এই ধারাবাহিক শব্দ মোছে না। তাই প্রতিসম
+        # বিনমিয়াল লোপাস (২ পাস, σ≈২.৪ স্যাম্পল) — ল্যাগ নেই বললেই চলে
+        # (স্প্রিং-এর tau ০.৯s), কিন্তু শব্দের ছোট ছোট ধাপ মুছে যায়।
+        def soften(seq, passes=2):
+            """৯-ট্যাপ বিনমিয়াল লোপাস (প্রতিসম → অতিরিক্ত দেরি নেই)।"""
+            k = (1, 8, 28, 56, 70, 56, 28, 8, 1)
+            s = list(seq)
+            for _ in range(passes):
+                if len(s) < 9:
+                    return s
+                out = list(s)
+                for i in range(4, len(s) - 4):
+                    out[i] = sum(s[i + j - 4] * k[j] for j in range(9)) / 256.0
+                s = out
+            return s
+
+        rel_x, rel_y = soften(rel_x), soften(rel_y)
         # সব মানুষের মিলিত বাক্সের সীমা (প্রতি স্যাম্পলে) — ক্রপের বাইরে কেউ না যায়
         g_x0 = [gb[0] if gb else rel_x[i] for i, gb in enumerate(gboxes)]
         g_x1 = [gb[2] if gb else rel_x[i] for i, gb in enumerate(gboxes)]
         g_y0 = [gb[1] if gb else rel_y[i] for i, gb in enumerate(gboxes)]
         g_y1 = [gb[3] if gb else rel_y[i] for i, gb in enumerate(gboxes)]
         g_x0, g_x1, g_y0, g_y1 = (median5(g) for g in (g_x0, g_x1, g_y0, g_y1))
+        # একই লোপাস বাক্সের কিনারাগুলোতে — ইউনিয়ন-বাক্স আর কেন্দ্র একসাথে
+        # শান্ত থাকে, তাই enforce_group-এর সীমাও কাঁপে না।
+        g_x0, g_x1, g_y0, g_y1 = (soften(g) for g in (g_x0, g_x1, g_y0, g_y1))
 
         # Desired crop offsets in the *cropped* frame's pixels, for every sample
         # মাথার উপরে জায়গা: টার্গেট-লাইন ৫০% → ৪২% (মুখ একটু উপরে,
@@ -1201,9 +1261,9 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         face_y_frac = 0.42 if is_short else 0.50
 
         def enforce_group(sm, e0, e1, crop_sz, eff_sz):
-            """সব মানুষ ক্রপের ভিতরে রাখা (হার্ড নিয়ম, সবশেষে)। ৩% ফাঁক রাখি।
+            """সব মানুষ ক্রপের ভিতরে রাখা (হার্ড নিয়ম, সবশেষে)। ৬% ফাঁক রাখি।
             সব মানুষ ক্রপের চেয়ে বড় হলে (খুব কাছের শট) মাঝখানে বসাই।"""
-            m = crop_sz * 0.03
+            m = crop_sz * 0.06
             out = []
             for c, a, b in zip(sm, e0, e1):
                 A, B = a * eff_sz, b * eff_sz
