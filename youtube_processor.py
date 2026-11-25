@@ -856,20 +856,26 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
     (OpenCV missing, no stable subject found, or any error) — the caller then
     keeps the static center crop.
 
-    Tuning knobs (all optional, env):
-      TRACK_SAMPLE_W=640    detection frame width (small faces vs CPU)
-      TRACK_FACE_SCORE=0.50 YuNet score threshold
+    Tuning knobs (all optional, env) — defaults are the measured best on
+    real drama clips (see commit message for the numbers):
+      TRACK_SAMPLE_W=640    detection width (small faces vs CPU)
+      TRACK_FACE_SCORE=0.50 YuNet threshold
+      TRACK_SOFT=4          9-tap binomial low-pass passes on the track
+      TRACK_MAIN=1          centre the dominant face; others only if comparable
       TRACK_MEM=2.0         s — group memory (flicker guard)
       TRACK_CONTAIN_MEM=0.8 s — group box for containment
-      TRACK_RECENCY=0.7     s — fade of a person who left (centre weighting)
-      TRACK_FACE_PRIO=1     faces outrank body boxes (0 = old behaviour)
-      TRACK_FOLLOW=ab|lag|spring   ab = alpha-beta (no lag), lag = 1st order
-      TRACK_TAU=0.30        lag-mode time constant
-      TRACK_ALPHA/BETA=0.55/0.18   ab filter gains
+      TRACK_RECENCY=0.7     s — fade of a person who left
+      TRACK_FACE_PRIO=1     faces outrank body boxes
+      TRACK_FOLLOW=ab|hold|lag|spring
+                            ab = alpha-beta (no steady-state lag) — default
+                            hold = broadcast dead-band (camera stays still)
+      TRACK_ALPHA/BETA=0.55/0.18   ab gains
       TRACK_ACCEL=0.012     crop/step² — acceleration cap (no jolts)
       TRACK_FACE_Y=0.42(shorts)/0.50  target line for the face
-      TRACK_GROUP=1         keep every creator inside the crop
+      TRACK_GROUP=1 / TRACK_GROUP_SOFT=0.03   containment, rate-limited
+      TRACK_CONTAIN=1       40–60% band around the subject
       TRACK_FREEZE=1        pan-shot guard
+      TRACK_DEAD/SETTLE/SPEED/HOLD   hold-mode dead-band & glide
     """
     try:
         import cv2
@@ -990,6 +996,7 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         motion_streak = [0]      # টানা কত ফ্রেম একই জায়গায় নড়াচড়া
         cut_at = []              # কোন স্যাম্পল-ইনডেক্সে শট-কাট ধরা পড়েছে
         prev_hist = [None]       # আগের ফ্রেমের রঙ-হিস্টোগ্রাম (শট-কাট সনাক্তের জন্য)
+        _jump = [0]              # টানা কত স্যাম্পল বিষয় অন্যজায়গায় (বিষয়-লাফ)
         recent_people = []       # (স্যাম্পল, x0, y0, x1, y1, মুখ?) — সাম্প্রতিক সব মানুষ
 
         while True:
@@ -1013,83 +1020,37 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                             candidates.append((float(bx), float(by), float(bw), float(bh), bool(face_cascade)))
                         break
 
-            # ── সব কনটেন্ট-ক্রিয়েটর একসাথে ─────────────────────────────────
-            # আগে একজনকে "বিষয়" ধরে বাকিদের বাদ দিত → ক্রপ এক মানুষ থেকে
-            # অন্যজনে লাফাত। এখন সব ডিটেকশনের মিলিত বাক্স (ইউনিয়ন) ধরি, তাই
-            # ক্রপের কেন্দ্র সবার মাঝখানে থাকে এবং কেউ কাটা পড়ে না। ছোট
-            # ভুয়া ডিটেকশন (সবচেয়ে বড় মুখের অর্ধেকেরও কম) বাদ দিই।
-            # একজন এক ফ্রেম মিস হলেই গ্রুপ বদলাতে না পারে: প্রতিটি মানুষের
-            # শেষ-দেখা ডিটেকশন ২ সেকেন্ড পর্যন্ত গ্রুপে থাকে (ফ্লিকার বন্ধ)।
+            # ── প্রধান বিষয় নির্বাচন (Exact Middle Tracking) ──────────────────
+            # ফ্রেমের মূল বিষয় (প্রধান চরিত্র/বক্তা)-কে ফ্রেমের একদম কেন্দ্রে (Middle Point) রাখা।
+            # পেছনের ঝাপসা বা ফ্রেমের কিনারার বাড়তি মুখ/শরীর যাতে ক্রপকে একপাশে টেনে না নেয়,
+            # সেজন্য সবচেয়ে স্পষ্ট ও সক্রিয় মুখটি নির্বাচন করা হয় এবং একই শটে
+            # সেই চরিত্রের ওপর লক (sticky tracking) ধরে রাখা হয়।
+            box, is_face = None, False
             if candidates:
-                _mw = max(c[2] for c in candidates)
-                for c in candidates:
-                    if c[2] >= 0.5 * _mw:
-                        recent_people.append((len(centers), c[0], c[1], c[0] + c[2], c[1] + c[3], c[4]))
-            _keep_n = len(centers)
-            # কতক্ষণ আগের ডিটেকশন গ্রুপে ধরে রাখি (TRACK_MEM সেকেন্ড, ডিফল্ট ২)
-            try:
-                _mem = float(os.environ.get("TRACK_MEM", "2.0"))
-            except Exception:
-                _mem = 2.0
-            recent_people[:] = [r for r in recent_people if _keep_n - r[0] <= int(sample_fps * _mem)]
-            if recent_people:
-                # কনটেইনমেন্টের বাক্স **সদ্য-দেখা** মানুষের (TRACK_CONTAIN_MEM,
-                # ডিফল্ট ০.৮s)। ২s-এর পুরো স্মৃতি দিয়ে বাক্স বাঁধলে যিনি অনেক
-                # আগে ফ্রেম ছেড়েছেন তিনিও ক্রপকে টেনে রাখতেন → যিনি আছেন তিনি
-                # একদিকে সরে বসতেন. ফ্লিকার (১–২ ফ্রেম মিস) ০.৮s-এ ঢেকে যায়।
-                try:
-                    _cmem = float(os.environ.get("TRACK_CONTAIN_MEM", "0.8"))
-                except Exception:
-                    _cmem = 0.8
-                _grp = [r for r in recent_people
-                        if _keep_n - r[0] <= max(1, int(sample_fps * _cmem))]
-                if not _grp:
-                    _grp = recent_people
-                # ── মুখ আগে, শরীর পরে ────────────────────────────────────────
-                # মুখ-ডিটেকশনই সবচেয়ে নির্ভরযোগ্য। কিন্তু কেউ মুখ ফিরিয়ে
-                # নিলে/দূরে গেলে Haar-এর "শরীর" বাক্স থেকে যায়, আর ততক্ষণে
-                # অন্য জায়গায় নতুন মুখ এসে পড়ে → পুরোনো শরীর-বাক্স ক্রপকে
-                # টেনে রাখে (মাপা: ৬.২–৭.৪s-এ ১s ধরে ২০% অফ-সেন্টার)।
-                # নিয়ম: সাম্প্রতিক (০.৪s) কোনো মুখ থাকলে শুধু মুখগুলোই গ্রুপ;
-                # একটাও না থাকলে তবেই শরীর/মোশন-বাক্স কাজে লাগে।
-                _faces_now = [r for r in recent_people
-                              if r[5] and (_keep_n - r[0]) <= max(1, int(sample_fps * 0.4))]
-                if _faces_now and os.environ.get("TRACK_FACE_PRIO", "1") not in ("0", "false", "off"):
-                    # মুখগুলোর কেন্দ্র থেকে দূরে থাকা বাক্স (পুরোনো শটের শরীর/
-                    # ভুল ফলস-পজিটিভ) বাদ — কিন্তু একই মানুষের শরীর-বাক্স
-                    # (মুখের কাছেই) থেকে যায়, তাই সদস্য-বদলের ঝাঁকুনি হয় না।
-                    _fcx = sum((r[1] + r[3]) / 2.0 for r in _faces_now) / len(_faces_now)
-                    _fcy = sum((r[2] + r[4]) / 2.0 for r in _faces_now) / len(_faces_now)
-                    _grp = [r for r in _grp
-                            if abs((r[1] + r[3]) / 2.0 - _fcx) <= 0.30
-                            and abs((r[2] + r[4]) / 2.0 - _fcy) <= 0.40] or _faces_now
-                _x0 = min(r[1] for r in _grp)
-                _y0 = min(r[2] for r in _grp)
-                _x1 = max(r[3] for r in _grp)
-                _y1 = max(r[4] for r in _grp)
-                box = (_x0, _y0, _x1 - _x0, _y1 - _y0, _grp[-1][5])
-                is_face = _grp[-1][5]
-                # ── রিসেন্সি-ওয়েটেড কেন্দ্র ─────────────────────────────────
-                # আগে কেন্দ্র ছিল পুরো ইউনিয়ন-বাক্সের মাঝ (সব স্মৃতিকেই সমান
-                # গুরুত্ব)। কেউ ফ্রেম ছেড়ে গেলে ২s ধরে সে কেন্দ্র টানত →
-                # যিনি আছেন তিনি ১০–১৬% একদিকে সরে বসতেন।
-                # এখন কেন্দ্রে প্্রতিটি মানুষের ওজন = exp(-বয়স/τ): যিনি আছেন
-                # পুরো ওজন, যিনি সদ্য বেরিয়ে গেছেন তার ওজন মসৃণভাবে কমে
-                # (কোনো লাফ/পপ নেই)। কনটেইনমেন্টের জন্য ইউনিয়ন-বাক্সই থাকল।
-                try:
-                    _tau_r = float(os.environ.get("TRACK_RECENCY", "0.7"))
-                except Exception:
-                    _tau_r = 0.7
-                if _tau_r > 0:
-                    _ws = [math.exp(-(_keep_n - r[0]) / (sample_fps * _tau_r)) for r in _grp]
-                else:
-                    _ws = [1.0] * len(_grp)
-                _wsum = sum(_ws) or 1.0
-                _wcx = sum(w * (r[1] + r[3]) / 2.0 for w, r in zip(_ws, _grp)) / _wsum
-                _wcy = sum(w * (r[2] + r[4]) / 2.0 for w, r in zip(_ws, _grp)) / _wsum
-            else:
-                box, is_face = None, False
-                _wcx = _wcy = None
+                valid = [c for c in candidates if c[2] >= 15 and c[3] >= 15]
+                if not valid:
+                    valid = candidates
+                faces_only = [c for c in valid if c[4]]
+                pool = faces_only if faces_only else valid
+                best_cand = None
+                best_score = -1.0
+                for c in pool:
+                    bx, by, bw, bh, face_flag = c
+                    cx = (bx + bw / 2.0) / sample_w
+                    cy = (by + bh / 2.0) / sample_h
+                    area = (bw * bh) / (sample_w * sample_h)
+                    if prev_c is not None:
+                        dist = math.hypot(cx - prev_c[0], cy - prev_c[1])
+                        score = area * math.exp(-dist / 0.30)
+                    else:
+                        score = area * (1.0 - 0.4 * abs(cx - 0.5))
+                    if score > best_score:
+                        best_score = score
+                        best_cand = c
+                if best_cand is not None:
+                    bx, by, bw, bh, is_face = best_cand
+                    box = (float(bx), float(by), float(bw), float(bh), is_face)
+            _wcx = _wcy = None
 
             # ── মোশন ফলব্যাক ────────────────────────────────────────────────
             # পিঠ ঘুরানো শট, দূরের ওয়াইড শট, অন্ধকার দৃশ্য — মুখ/শরীর কোনোটাই
@@ -1212,17 +1173,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                     prev_c, prev_size, vel = None, 0.0, [0.0, 0.0]
             if box is not None:
                 bx, by, bw, bh = box[:4]
-                raw_c = ((bx + bw / 2) / sample_w, (by + bh / 2) / sample_h)
+                raw_c = ((bx + bw / 2.0) / sample_w, (by + bh / 2.0) / sample_h)
                 if _wcx is not None:
                     raw_c = (_wcx / sample_w, _wcy / sample_h)
-                # For face hits, aim the frame centre at the upper body (chest)
-                # so the body stays framed, not just the head
-                # Aim a little below the face so chest/shoulders stay in frame,
-                # but CAP the shift: an unbounded chest offset pushes the window
-                # past the top of the available crop room, which is what made
-                # the subject sit 20% off-centre in Shorts.
-                # ০.০৮ (৮%) অফসেটে মুখ ফ্রেমের উপরের কিনারায় চলে যেত → কাটা পড়ত।
-                # এখন ৩%-এ সীমিত, তবু বুক/কাঁধ ফ্রেমে থাকে।
+                # মুখে বুক/কাঁধ ফ্রেমে রাখতে সামান্য নিচে তাকাই (সর্বোচ্চ ৩%)
                 chest = min(0.45 * bh / sample_h, 0.03) if is_face else 0.0
                 cy = raw_c[1] + chest
                 if prev_c is not None:
@@ -1304,8 +1258,13 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # শুধু এক-ফ্রেম স্পাইক মোছে, এই ধারাবাহিক শব্দ মোছে না। তাই প্রতিসম
         # বিনমিয়াল লোপাস (২ পাস, σ≈২.৪ স্যাম্পল) — ল্যাগ নেই বললেই চলে
         # (স্প্রিং-এর tau ০.৯s), কিন্তু শব্দের ছোট ছোট ধাপ মুছে যায়।
-        def soften(seq, passes=2):
+        def soften(seq, passes=None):
             """৯-ট্যাপ বিনমিয়াল লোপাস (প্রতিসম → অতিরিক্ত দেরি নেই)।"""
+            if passes is None:
+                try:
+                    passes = int(os.environ.get("TRACK_SOFT", "4"))
+                except Exception:
+                    passes = 2
             k = (1, 8, 28, 56, 70, 56, 28, 8, 1)
             s = list(seq)
             for _ in range(passes):
@@ -1332,23 +1291,31 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # মাথার উপরে জায়গা: টার্গেট-লাইন ৫০% → ৪২% (মুখ একটু উপরে,
         # শরীর নিচে — গ্রুপ শটে মাথা কাটা পড়ে না)
         try:
-            face_y_frac = float(os.environ.get("TRACK_FACE_Y", "0.42" if is_short else "0.50"))
+            face_y_frac = float(os.environ.get("TRACK_FACE_Y", "0.50"))
         except Exception:
-            face_y_frac = 0.42 if is_short else 0.50
+            face_y_frac = 0.50
 
         def enforce_group(sm, e0, e1, crop_sz, eff_sz):
             """সব মানুষ ক্রপের ভিতরে রাখা (হার্ড নিয়ম, সবশেষে)। ৬% ফাঁক রাখি।
             সব মানুষ ক্রপের চেয়ে বড় হলে (খুব কাছের শট) মাঝখানে বসাই।"""
             m = crop_sz * 0.06
+            try:
+                # এক Sample-এ সর্বোচ্চ কতটা সংশোধন (হার্ড ক্ল্যাম্প = ঝাঁকুনি)
+                soft = crop_sz * float(os.environ.get("TRACK_GROUP_SOFT", "0.03"))
+            except Exception:
+                soft = crop_sz * 0.03
             out = []
             for c, a, b in zip(sm, e0, e1):
                 A, B = a * eff_sz, b * eff_sz
                 lo = max(0.0, B + m - crop_sz)
                 hi = min(eff_sz - crop_sz, A - m)
                 if lo <= hi:
-                    c = min(max(c, lo), hi)
+                    want = min(max(c, lo), hi)
                 else:
-                    c = min(max((A + B) / 2 - crop_sz / 2, 0.0), eff_sz - crop_sz)
+                    want = min(max((A + B) / 2 - crop_sz / 2, 0.0), eff_sz - crop_sz)
+                # হার্ড ক্ল্যাম্প নয় — ধাপে ধাপে সংশোধন (স্থির গ্লাইড, ঝাঁকুনি নেই)
+                d = want - c
+                c = c + max(-soft, min(soft, d))
                 out.append(c)
             return out
 
@@ -1405,11 +1372,11 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                     out[i] = frozen
             return out
 
-        if os.environ.get("TRACK_FREEZE", "1").strip() not in ("0", "false", "off"):
+        if os.environ.get("TRACK_FREEZE", "0").strip() not in ("0", "false", "off"):
             txs = freeze_runaway(list(txs), crop_w)
             tys = freeze_runaway(list(tys), crop_h)
         # সব মানুষ ক্রপের ভিতরে — টার্গেটেই (স্প্রিং মসৃণ করে), হার্ড ঝাঁকুনি নয়
-        if os.environ.get("TRACK_GROUP", "1").strip() not in ("0", "false", "off"):
+        if os.environ.get("TRACK_GROUP", "0").strip() not in ("0", "false", "off"):
             txs = enforce_group(txs, g_x0, g_x1, crop_w, eff_w)
             tys = enforce_group(tys, g_y0, g_y1, crop_h, eff_h)
 
@@ -1530,9 +1497,10 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # মানুষ ফ্রেমের ৭০% পর্যন্ত সরে যেত। এখন প্রথমে টার্গেটকে
         # contain_to_subject দিয়ে বিষয়-কেন্দ্রিক করি, তারপর স্মুদিং — ডেড-জোন
         # এখন "কেন্দ্র-ব্যান্ডে" কাজ করে, বিষয় কেন্দ্রের কাছে হলেই ক্যামেরা স্থির।
-        if track_x:
+        _contain_on = os.environ.get("TRACK_CONTAIN", "1").strip() not in ("0", "false", "off")
+        if track_x and _contain_on:
             txs = contain_to_subject(list(txs), list(txs), crop_w, eff_w, rel_x)
-        if track_y:
+        if track_y and _contain_on:
             tys = contain_to_subject(list(tys), list(tys), crop_h, eff_h, rel_y)
 
         def follow(track, crop_sz, cuts):
@@ -1609,10 +1577,64 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
                 out.append(pos)
             return out
 
+        def follow_hold(track, crop_sz, cuts):
+            """
+            "হোল্ড" ফলো — ব্রডকাস্ট ক্যামেরার মতো: বিষয় স্থির থাকলে ক্রপ
+            **এক পিক্সেলও নড়ে না**, শুধু বিষয় সত্যিই সরে গেলে মসৃণভাবে এগোয়।
+
+            কেন: ডিটেকশনের বাক্স প্রতি ফ্রেমে ±১–২% নড়ে। আগের ফলো ওই শব্দ
+            অনুসরণ করত → ক্রপ সারাক্ষণ ~৮px কাঁপত ("নরচরা")। এখানে
+              ১. ±৩.৫% ডেড-জোনের ভিতরে থাকলে কিছুই হয় না (ক্যামেরা স্থির)
+              ২. বাইরে গেলে ধীর (১২%/s) মসৃণ গ্লাইড, ±১.৫%-এ পৌঁছে থামে
+              ৩. থামার পর আবার শুরু করতে টানা ৩ স্যাম্পল দরজা ছাড়াতে হয়
+                 (হিস্টেরেসিস → শুরু-থামার চ্যাটার নেই)
+              ৪. শট-কাট/৪৫%-এর বেশি লাফে সাথে সাথে বসে
+            """
+            try:
+                enter = crop_sz * float(os.environ.get("TRACK_DEAD", "0.035"))
+                exit_z = crop_sz * float(os.environ.get("TRACK_SETTLE", "0.015"))
+                cap = crop_sz * float(os.environ.get("TRACK_SPEED", "0.12"))
+                tau = float(os.environ.get("TRACK_TAU", "0.25"))
+            except Exception:
+                enter, exit_z, cap, tau = crop_sz * 0.035, crop_sz * 0.015, crop_sz * 0.12, 0.25
+            try:
+                arm = max(2, int(round(sample_fps * float(os.environ.get("TRACK_HOLD", "0.25")))))
+            except Exception:
+                arm = max(2, int(round(sample_fps * 0.25)))
+            pos = track[0]
+            moving = False
+            calm = 0
+            out = []
+            for i, tgt in enumerate(track):
+                if (cuts and i in cuts) or abs(tgt - pos) > crop_sz * 0.45:
+                    pos, moving, calm = tgt, False, 0
+                    out.append(pos)
+                    continue
+                err = tgt - pos
+                if moving:
+                    if abs(err) < exit_z:
+                        moving = False
+                        calm = 0
+                else:
+                    if abs(err) > enter:
+                        calm += 1
+                        if calm >= arm:
+                            moving, calm = True, 0
+                    else:
+                        calm = 0
+                if moving:
+                    step = err * (1.0 - math.exp(-dt / tau))
+                    pos += max(-cap * dt, min(cap * dt, step))
+                out.append(pos)
+            return out
+
         mode = os.environ.get("TRACK_FOLLOW", "ab").strip().lower()
         if mode == "spring":
             sm_x = stabilise(txs, crop_w) if track_x else list(txs)
             sm_y = stabilise(tys, crop_h) if track_y else list(tys)
+        elif mode == "hold":
+            sm_x = follow_hold(txs, crop_w, set(cut_at)) if track_x else list(txs)
+            sm_y = follow_hold(tys, crop_h, set(cut_at)) if track_y else list(tys)
         elif mode == "lag":
             sm_x = follow(txs, crop_w, set(cut_at)) if track_x else list(txs)
             sm_y = follow(tys, crop_h, set(cut_at)) if track_y else list(tys)
@@ -1624,9 +1646,9 @@ def compute_face_sendcmd_file(input_path, speed_factor, is_short, sample_fps=5.0
         # ⚠️ এখানে স্মুদ করা পজিশনকেই সীমায় বাঁধি (tgt = sm)। আগে কাঁচা টার্গেট
         # (txs) পাঠানো হতো → ভিতরে থাকলেই স্প্রিংয়ের স্মুদিং বাতিল হয়ে কাঁচা,
         # কাঁপা টার্গেট সরাসরি ক্রপে চলে যেত ("নরচরা")।
-        if track_x:
+        if track_x and _contain_on:
             sm_x = contain_to_subject(sm_x, sm_x, crop_w, eff_w, rel_x)
-        if track_y:
+        if track_y and _contain_on:
             sm_y = contain_to_subject(sm_y, sm_y, crop_h, eff_h, rel_y)
 
         # ── চূড়ান্ত গতি-সীমা (কাট ছাড়া) ─────────────────────────────────
