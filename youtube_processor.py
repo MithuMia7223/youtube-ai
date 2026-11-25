@@ -1801,8 +1801,13 @@ def _bgm_candidates(bgm_dir: str) -> list[str]:
         BGM_POOL=own   → শুধু নিজের গান (খালি হলে cc0 fallback)
         BGM_POOL=cc0   → শুধু কপিরাইট-ফ্রি ট্র্যাক
         BGM_POOL=mix   → দুটোই মিশিয়ে র‍্যান্ডম
+        BGM_OFF=1      → কোনো BGM-ই মেশানো হবে না (শুধু নাটকের কণ্ঠ)
         (ডিফল্ট: own-এ কিছু থাকলে own, নইলে cc0)
     """
+    # BGM_OFF=1 → কোনো BGM নয় — ফাঁকা তালিকা দিলে কলাররা নিজে থেকেই BGM বাদ দেয়
+    if os.environ.get("BGM_OFF", "").strip() == "1":
+        return []
+
     _bad = {"bgm_combined.mp3"}          # ২১ MB কনক্যাট — BGM হিসেবে অচল
 
     def _mp3(d: str, allow_legacy: bool = False) -> list[str]:
