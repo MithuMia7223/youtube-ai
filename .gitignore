@@ -13,3 +13,5 @@ venv/
 .venv/
 bot.lock
 .job_state.json
+cookies.txt
+token_cache/
