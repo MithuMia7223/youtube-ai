@@ -817,15 +817,15 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
     if is_short:
         z = TRACK_ZOOM_SHORT
         out = f"scale={out_w or 1080}:{out_h or 1080}:flags=lanczos"
-        # ⚠️ x=0:y=0 (plain integers, NOT expressions) — if we use x='(iw-ow)/2' FFmpeg
-        # re-evaluates the expression every frame and overwrites sendcmd's value with the
-        # centred default.  Plain 0 is set once at init; every sendcmd after that sticks.
-        # sendcmd will position from frame-0, so the first few frames use x=0 until the
-        # first sendcmd at t=0.000 fires (which is the very first frame).
+        # ⚠️ sendcmd থাকলে x=0:y=0 (plain integers, NOT expressions) — expression হলে FFmpeg
+        # প্রতি ফ্রেমে re-evaluate করে sendcmd-এর মান overwrite করে ফেলে (জিটার)।
+        # ⚠️ কিন্তু sendcmd ফাইল না থাকলে (মুখ/বিষয় শনাক্ত না হলে) x=0:y=0 দিলে ক্রপ
+        # উপরের-বাম কোণায় আটকে যায় — তখন কেন্দ্র-ক্রপই সঠিক (আগের কোড)।
+        _c = "x=0:y=0" if face_cmd_prefix else "x='(iw-ow)/2':y='(ih-oh)/2'"
         return (
             f"scale=iw*{z}:ih*{z},{face_cmd_prefix}"
             f"crop@sq=w='trunc(min(iw,ih)/{z}/2)*2':h='trunc(min(iw,ih)/{z}/2)*2':"
-            f"x=0:y=0,{out}"
+            f"{_c},{out}"
         )
     # লং: ক্রপ-উইন্ডো **১৬:৯** — উৎস ৪:৩ বা ৯:১৬ হলেও আউটপুট বিকৃত হবে না,
     # আর উইন্ডো ফ্রেমের ভিতরে থাকে বলে কোনো কালো বার আসে না।
@@ -833,12 +833,14 @@ def track_crop_chain(face_cmd_prefix="", is_short=False, out_w=None, out_h=None)
     # ⚠️ এই চেইনে **একটাই** crop থাকতে হবে — sendcmd `crop x/y` ফিল্টার-ইনডেক্স
     # ধরে কাজ করে; বাড়তি crop বসালে কমান্ড ভুল ফিল্টারে গিয়ে ট্র্যাকিং স্থির
     # হয়ে যায় (ঠিক এই ভুলটাই হয়েছিল)। ক্রপ-উইন্ডো ১৬:৯, তাই scale-ই যথেষ্ট।
-    # Same fix as above: x=0:y=0 (plain integers) so sendcmd overrides stick.
+    # Same fix as above: sendcmd থাকলে x=0:y=0 যাতে sendcmd-এর মান টিকে যায়,
+    # sendcmd না থাকলে কেন্দ্র-ক্রপ (নইলে ফ্রেম উপরের-বাম কোণা দেখাত)।
+    _c = "x=0:y=0" if face_cmd_prefix else "x='(iw-ow)/2':y='(ih-oh)/2'"
     return (
         f"{face_cmd_prefix}"
         f"crop@sq=w='trunc(min(iw,ih*16/9)/{TRACK_ZOOM_LONG}/2)*2':"
         f"h='trunc(min(ih,iw*9/16)/{TRACK_ZOOM_LONG}/2)*2':"
-        f"x=0:y=0,{out},setsar=1"
+        f"{_c},{out},setsar=1"
     )
 
 
